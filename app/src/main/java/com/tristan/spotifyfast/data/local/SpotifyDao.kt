@@ -4,6 +4,7 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.room.Transaction
 import kotlinx.coroutines.flow.Flow
 
 @Dao
@@ -38,12 +39,18 @@ interface SpotifyDao {
     @Query("UPDATE playlists SET dominantColorArgb = :colorArgb WHERE uri = :uri")
     suspend fun updatePlaylistColor(uri: String, colorArgb: Int)
 
+    @Query("UPDATE playlists SET trackCount = :trackCount WHERE uri = :uri")
+    suspend fun updatePlaylistTrackCount(uri: String, trackCount: Int)
+
     // Tracks
     @Query("SELECT * FROM tracks WHERE contextUri = :contextUri ORDER BY positionInContext ASC")
     fun observeTracksForContext(contextUri: String): Flow<List<TrackEntity>>
 
     @Query("SELECT * FROM tracks WHERE contextUri = :contextUri ORDER BY positionInContext ASC")
     suspend fun getTracksForContextOnce(contextUri: String): List<TrackEntity>
+
+    @Query("SELECT COUNT(*) FROM tracks WHERE contextUri = :contextUri")
+    suspend fun getTracksCountForContext(contextUri: String): Int
 
     @Query("SELECT * FROM tracks WHERE uri = :uri LIMIT 1")
     suspend fun findTrackByUriOnce(uri: String): TrackEntity?
@@ -68,6 +75,14 @@ interface SpotifyDao {
 
     @Query("DELETE FROM tracks WHERE contextUri = :contextUri")
     suspend fun deleteTracksForContext(contextUri: String)
+
+    @Transaction
+    suspend fun replaceTracksForContext(contextUri: String, items: List<TrackEntity>) {
+        deleteTracksForContext(contextUri)
+        if (items.isNotEmpty()) {
+            upsertTracks(items)
+        }
+    }
 
     // Albums
     @Query("SELECT * FROM albums ORDER BY addedAtEpochMs DESC")

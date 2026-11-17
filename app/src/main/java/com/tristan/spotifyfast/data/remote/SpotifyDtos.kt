@@ -30,10 +30,17 @@ data class PagingDto<T>(
 }
 
 @Serializable
+data class CursorsDto(
+    val after: String? = null,
+    val before: String? = null,
+)
+
+@Serializable
 data class CursorPagingDto<T>(
     @SerialName("items") val rawItems: List<T?> = emptyList(),
     val limit: Int = 20,
     val next: String? = null,
+    val cursors: CursorsDto? = null,
 ) {
     val items: List<T> get() = rawItems.filterNotNull()
 }
@@ -63,6 +70,18 @@ data class PlaylistSimplifiedDto(
     val tracks: PlaylistItemsRefDto? = null,
 ) {
     val itemCount: Int get() = items?.total ?: tracks?.total ?: 0
+}
+
+@Serializable
+data class PlaylistFullDto(
+    val id: String = "",
+    val uri: String = "",
+    val name: String = "",
+    @SerialName("snapshot_id") val snapshotId: String? = null,
+    val items: PagingDto<PlaylistItemWrapperDto>? = null,
+    val tracks: PagingDto<PlaylistItemWrapperDto>? = null,
+) {
+    val resolvedPaging: PagingDto<PlaylistItemWrapperDto>? get() = items ?: tracks
 }
 
 @Serializable

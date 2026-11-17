@@ -242,4 +242,165 @@ class SpotifyWebApi2026ContractTest {
         assertEquals(1, status.playlists)
         assertEquals(1, status.artists)
     }
+
+    @Test
+    fun `sync engine paginates all playlists, playlist tracks beyond 50, and liked tracks beyond 50`() = runTest {
+        tokenStore.saveTokenBundle(
+            AuthTokenBundle("cid", "tok", "ref", System.currentTimeMillis() + 3600_000L),
+        )
+        // Pre-seed truncated v1.3.0 cache (50 tracks stored even though API has 130 tracks and same snapshot)
+        db.spotifyDao().upsertPlaylists(
+            listOf(
+                PlaylistEntity(
+                    id = "big_pl",
+                    uri = "spotify:playlist:big_pl",
+                    name = "Big Playlist",
+                    snapshotId = "snap_big",
+                    trackCount = 130,
+                ),
+            ),
+        )
+        db.spotifyDao().upsertTracks(
+            (0 until 50).map { idx ->
+                com.tristan.spotifyfast.data.local.TrackEntity(
+                    uri = "spotify:track:old_$idx",
+                    id = "old_$idx",
+                    contextUri = "spotify:playlist:big_pl",
+                    positionInContext = idx,
+                    title = "Old $idx",
+                    artistName = "Artist",
+                    albumName = "Album",
+                    artworkUrl = null,
+                    durationMs = 180_000L,
+                )
+            },
+        )
+
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                val p = request.path.orEmpty()
+                val offset = Regex("[?&]offset=(\\d+)").find(p)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                val limit = Regex("[?&]limit=(\\d+)").find(p)?.groupValues?.get(1)?.toIntOrNull() ?: 50
+                return when {
+                    p.startsWith("/v1/me/playlists") -> {
+                        val totalPlaylists = 55
+                        val end = (offset + limit).coerceAtMost(totalPlaylists)
+                        val jsonItems = (offset until end).joinToString(",") { i ->
+                            if (i == 25) {
+                                """{"id":"big_pl","uri":"spotify:playlist:big_pl","name":"Big Playlist","snapshot_id":"snap_big","items":{"total":130}}"""
+                            } else {
+                                """{"id":"pl_$i","uri":"spotify:playlist:pl_$i","name":"Playlist $i","snapshot_id":"snap_$i","items":{"total":1}}"""
+                            }
+                        }
+                        val nextField = if (end < totalPlaylists) """"${server.url("/v1/me/playlists?limit=50&offset=$end")}"""" else "null"
+                        MockResponse().setResponseCode(200).setBody(
+                            """{"items":[$jsonItems],"limit":$limit,"offset":$offset,"total":$totalPlaylists,"next":$nextField}""",
+                        )
+                    }
+                    p.startsWith("/v1/playlists/big_pl/items") -> {
+                        val totalTracks = 130
+                        val end = (offset + limit).coerceAtMost(totalTracks)
+                        val jsonItems = (offset until end).joinToString(",") { i ->
+                            """{"item":{"id":"bt_$i","uri":"spotify:track:bt_$i","name":"Big Track $i","type":"track","duration_ms":200000,"artists":[{"id":"a1","name":"Artist"}]}}"""
+                        }
+                        val nextField = if (end < totalTracks) """"${server.url("/v1/playlists/big_pl/items?limit=50&offset=$end")}"""" else "null"
+                        MockResponse().setResponseCode(200).setBody(
+                            """{"items":[$jsonItems],"limit":$limit,"offset":$offset,"total":$totalTracks,"next":$nextField}""",
+                        )
+                    }
+                    p.startsWith("/v1/playlists/pl_") && p.contains("/items") -> {
+                        val id = p.substringAfter("/v1/playlists/").substringBefore("/items")
+                        MockResponse().setResponseCode(200).setBody(
+                            """{"items":[{"item":{"id":"t_$id","uri":"spotify:track:t_$id","name":"Song $id","type":"track","duration_ms":180000}}],"total":1,"next":null}""",
+                        )
+                    }
+                    p.startsWith("/v1/me/tracks") -> {
+                        val totalLiked = 125
+                        val end = (offset + limit).coerceAtMost(totalLiked)
+                        val jsonItems = (offset until end).joinToString(",") { i ->
+                            """{"track":{"id":"lk_$i","uri":"spotify:track:lk_$i","name":"Liked $i","type":"track","duration_ms":210000,"artists":[{"id":"a1","name":"Artist"}]}}"""
+                        }
+                        val nextField = if (end < totalLiked) """"${server.url("/v1/me/tracks?limit=50&offset=$end")}"""" else "null"
+                        MockResponse().setResponseCode(200).setBody(
+                            """{"items":[$jsonItems],"limit":$limit,"offset":$offset,"total":$totalLiked,"next":$nextField}""",
+                        )
+                    }
+                    p.startsWith("/v1/me/albums") -> {
+                        val totalAlbums = 55
+                        val end = (offset + limit).coerceAtMost(totalAlbums)
+                        val jsonItems = (offset until end).joinToString(",") { i ->
+                            """{"album":{"id":"alb_$i","uri":"spotify:album:alb_$i","name":"Album $i","total_tracks":10,"artists":[{"id":"ar1","name":"Artist"}]}}"""
+                        }
+                        val nextField = if (end < totalAlbums) """"${server.url("/v1/me/albums?limit=50&offset=$end")}"""" else "null"
+                        MockResponse().setResponseCode(200).setBody(
+                            """{"items":[$jsonItems],"limit":$limit,"offset":$offset,"total":$totalAlbums,"next":$nextField}""",
+                        )
+                    }
+                    else -> MockResponse().setResponseCode(200).setBody("""{"items":[],"total":0,"next":null}""")
+                }
+            }
+        }
+
+        val engine = OfflineFirstSyncEngine(db.spotifyDao(), api, tokenStore)
+        val result = engine.syncAll()
+        assertTrue(result.isSuccess)
+
+        // All 55 playlists synced Metadata + items (beyond 20 and 50 caps!)
+        assertEquals(55, db.spotifyDao().getAllPlaylistsOnce().size)
+        assertEquals(1, db.spotifyDao().getTracksForContextOnce("spotify:playlist:pl_54").size)
+
+        // Pre-seeded truncated big_pl (was 50) re-synced in full to 130 tracks
+        val bigTracks = db.spotifyDao().getTracksForContextOnce("spotify:playlist:big_pl")
+        assertEquals(130, bigTracks.size)
+        assertEquals("Big Track 0", bigTracks.first().title)
+        assertEquals("Big Track 129", bigTracks.last().title)
+
+        // All 125 liked tracks synced (beyond 50 cap!)
+        val likedTracks = db.spotifyDao().getTracksForContextOnce(com.tristan.spotifyfast.data.local.LIKED_TRACKS_CONTEXT_URI)
+        assertEquals(125, likedTracks.size)
+        assertEquals("Liked 0", likedTracks.first().title)
+        assertEquals("Liked 124", likedTracks.last().title)
+
+        // All 55 saved albums synced (beyond 50 cap!)
+        assertEquals(55, db.spotifyDao().observeAlbums().first().size)
+    }
+
+    @Test
+    fun `sync engine falls back to full playlist container with pagination and tracks 403 restricted playlists`() = runTest {
+        tokenStore.saveTokenBundle(
+            AuthTokenBundle("cid", "tok", "ref", System.currentTimeMillis() + 3600_000L),
+        )
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                val p = request.path.orEmpty()
+                return when {
+                    p.startsWith("/v1/me/playlists") -> MockResponse().setResponseCode(200).setBody(
+                        """{"items":[{"id":"pl_obj","uri":"spotify:playlist:pl_obj","name":"Obj Playlist","items":{"total":2}},{"id":"pl_forbidden","uri":"spotify:playlist:pl_forbidden","name":"Spotify Mix","items":{"total":40}}],"total":2,"next":null}""",
+                    )
+                    p.startsWith("/v1/playlists/pl_obj/items") && !p.contains("page=2") -> MockResponse().setResponseCode(404)
+                    p.startsWith("/v1/playlists/pl_obj/tracks") -> MockResponse().setResponseCode(404)
+                    p.startsWith("/v1/playlists/pl_obj?") || p == "/v1/playlists/pl_obj" -> MockResponse().setResponseCode(200).setBody(
+                        """{"id":"pl_obj","uri":"spotify:playlist:pl_obj","name":"Obj Playlist","items":{"items":[{"item":{"id":"o1","uri":"spotify:track:o1","name":"Obj Track 1","duration_ms":180000}}],"total":2,"next":"${server.url("/v1/playlists/pl_obj/items?page=2")}"}}""",
+                    )
+                    p.startsWith("/v1/playlists/pl_obj/items?page=2") -> MockResponse().setResponseCode(200).setBody(
+                        """{"items":[{"item":{"id":"o2","uri":"spotify:track:o2","name":"Obj Track 2","duration_ms":190000}}],"total":2,"next":null}""",
+                    )
+                    p.startsWith("/v1/playlists/pl_forbidden") -> MockResponse().setResponseCode(403).setBody("""{"error":{"status":403,"message":"Forbidden"}}""")
+                    p.startsWith("/v1/me/following") -> MockResponse().setResponseCode(403)
+                    else -> MockResponse().setResponseCode(200).setBody("""{"items":[],"total":0,"next":null}""")
+                }
+            }
+        }
+
+        val engine = OfflineFirstSyncEngine(db.spotifyDao(), api, tokenStore)
+        val res = engine.syncAll()
+        assertTrue(res.isSuccess)
+
+        val objTracks = db.spotifyDao().getTracksForContextOnce("spotify:playlist:pl_obj")
+        assertEquals(2, objTracks.size)
+        assertEquals("Obj Track 2", objTracks[1].title)
+
+        assertTrue(engine.restrictedPlaylistUris.value.contains("spotify:playlist:pl_forbidden"))
+        assertTrue(engine.followedArtistsPermissionMissing.value)
+    }
 }

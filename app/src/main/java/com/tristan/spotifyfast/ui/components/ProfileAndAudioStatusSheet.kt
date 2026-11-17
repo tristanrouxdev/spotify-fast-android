@@ -53,6 +53,8 @@ fun ProfileAndAudioStatusSheet(
     isAppRemoteConnected: Boolean,
     needsSsoAuthorization: Boolean = false,
     syncStatus: SyncStatus = SyncStatus.Idle,
+    followedArtistsPermissionMissing: Boolean = false,
+    onReauthorizePermissions: () -> Unit = {},
     lastAudioError: String?,
     ssoFeedback: String? = null,
     githubRepo: String,
@@ -116,9 +118,9 @@ fun ProfileAndAudioStatusSheet(
                             color = SpotifyTokens.TextSecondary,
                         )
                     }
-                    SyncStatus.Syncing -> {
+                    is SyncStatus.Syncing -> {
                         Text(
-                            text = "Synchronisation en cours...",
+                            text = syncStatus.message,
                             style = MaterialTheme.typography.bodySmall,
                             color = SpotifyTokens.AccentGreen,
                         )
@@ -156,6 +158,18 @@ fun ProfileAndAudioStatusSheet(
                         text = if (syncStatus is SyncStatus.Syncing) "Synchronisation..." else "Synchroniser playlists & bibliothèque",
                         fontWeight = FontWeight.Bold,
                     )
+                }
+                if (!isDemoMode && followedArtistsPermissionMissing) {
+                    OutlinedButton(
+                        onClick = onReauthorizePermissions,
+                        enabled = syncStatus !is SyncStatus.Syncing,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            text = "Autoriser aussi les artistes suivis",
+                            color = SpotifyTokens.TextPrimary,
+                        )
+                    }
                 }
             }
 

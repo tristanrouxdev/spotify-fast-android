@@ -314,7 +314,7 @@ class PkceAuthManager(
         const val SPOTIFY_ACCOUNTS_BASE_URL = "https://accounts.spotify.com"
         const val DEFAULT_REDIRECT_PORT = 8888
         const val REQUIRED_SCOPES =
-            "user-read-private user-library-read user-library-modify " +
+            "user-read-private user-follow-read user-library-read user-library-modify " +
                 "playlist-read-private playlist-read-collaborative " +
                 "user-read-playback-state user-modify-playback-state " +
                 "user-read-currently-playing user-read-recently-played " +

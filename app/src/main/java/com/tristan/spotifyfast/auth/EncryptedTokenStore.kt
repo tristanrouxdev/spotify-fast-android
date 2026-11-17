@@ -8,6 +8,7 @@ import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.CoroutineDispatcher
@@ -256,6 +257,14 @@ class EncryptedTokenStore(
         }
     }
 
+    suspend fun getSyncSchemaVersion(): Int = withContext(ioDispatcher) {
+        dataStore.data.first()[KEY_SYNC_SCHEMA_VERSION] ?: 0
+    }
+
+    suspend fun setSyncSchemaVersion(version: Int) = withContext(ioDispatcher) {
+        dataStore.edit { prefs -> prefs[KEY_SYNC_SCHEMA_VERSION] = version }
+    }
+
     suspend fun enableDemoMode(clientId: String = "demo-client") = withContext(ioDispatcher) {
         saveUserProfile("Mode Démo", "offline")
         saveTokenBundle(
@@ -292,6 +301,7 @@ class EncryptedTokenStore(
         private val KEY_USER_PROFILE_NAME = stringPreferencesKey("spotify_user_name")
         private val KEY_USER_PRODUCT = stringPreferencesKey("spotify_user_product")
         private val KEY_GITHUB_REPO = stringPreferencesKey("github_repo_slug")
+        private val KEY_SYNC_SCHEMA_VERSION = intPreferencesKey("sync_schema_version")
         const val DEFAULT_GITHUB_REPO = "tristanrouxdev/spotify-fast-android"
     }
 }

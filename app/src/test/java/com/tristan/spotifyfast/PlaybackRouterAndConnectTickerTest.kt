@@ -406,4 +406,33 @@ class PlaybackRouterAndConnectTickerTest {
         assertEquals(1, targetedPhonePlay.get())
         assertTrue(router.playbackState.value.isPlaying)
     }
+
+    @Test
+    fun `playOnConnect centers uri window around selected track beyond index 50 in liked tracks`() = runTest {
+        val capturedBodies = mutableListOf<String>()
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                if (request.path.orEmpty().startsWith("/v1/me/player/play")) {
+                    capturedBodies += request.body.readUtf8()
+                    return MockResponse().setResponseCode(204)
+                }
+                return MockResponse().setResponseCode(200).setBody("{}")
+            }
+        }
+        val ioDispatcher = StandardTestDispatcher(testScheduler)
+        val connectMgr = SpotifyConnectManager(api, ioDispatcher)
+        val all700 = (0 until 700).map { "spotify:track:liked_$it" }
+        val res = connectMgr.playOnConnect(
+            deviceId = "phone_xiaomi",
+            uri = "spotify:track:liked_520",
+            contextUri = "spotify:collection:tracks",
+            offsetIndex = 520,
+            fallbackTrackUris = all700,
+        )
+        advanceUntilIdle()
+        assertTrue(res.isSuccess)
+        val body = capturedBodies.last()
+        assertTrue("Selected track beyond 50 must be included in payload: $body", body.contains("spotify:track:liked_520"))
+        assertTrue("Offset must target liked_520: $body", body.contains(""""offset":{"uri":"spotify:track:liked_520"}"""))
+    }
 }

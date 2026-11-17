@@ -18,11 +18,15 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -36,10 +40,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.tristan.spotifyfast.data.local.DEFAULT_DOMINANT_COLOR
+import com.tristan.spotifyfast.data.sync.SyncStatus
 import com.tristan.spotifyfast.player.UnifiedPlaybackState
 import com.tristan.spotifyfast.ui.components.EqualizerIndicator
 import com.tristan.spotifyfast.ui.components.MediaArtwork
@@ -64,12 +70,33 @@ fun CollectionDetailScreen(
 ) {
     val tracks by viewModel.observeTracksForContext(contextUri)
         .collectAsStateWithLifecycle(initialValue = emptyList())
-    var dominantColor by remember(contextUri) { mutableIntStateOf(DEFAULT_DOMINANT_COLOR) }
+    val syncStatus by viewModel.syncStatus.collectAsStateWithLifecycle()
+    val restrictedUris by viewModel.restrictedPlaylistUris.collectAsStateWithLifecycle()
+    var headerMeta by remember(contextUri) { mutableStateOf(CollectionHeaderMeta()) }
     var isSavedInLibrary by remember(contextUri) { mutableStateOf(true) }
+    var showSearch by remember(contextUri) { mutableStateOf(false) }
+    var filterQuery by remember(contextUri) { mutableStateOf("") }
 
     LaunchedEffect(contextUri) {
-        dominantColor = viewModel.getDominantColorForUri(contextUri)
+        headerMeta = viewModel.getCollectionMeta(contextUri)
         viewModel.refreshCollectionInBackground(contextUri)
+    }
+
+    val dominantColor = headerMeta.dominantColorArgb
+    val isRestricted = contextUri in restrictedUris
+    val displayedCount = maxOf(tracks.size, headerMeta.reportedTrackCount)
+    val filteredTracks = remember(tracks, filterQuery) {
+        val indexed = tracks.mapIndexed { idx, track -> idx to track }
+        val q = filterQuery.trim().lowercase()
+        if (q.isEmpty()) {
+            indexed
+        } else {
+            indexed.filter { (_, t) ->
+                t.title.lowercase().contains(q) ||
+                    t.artistName.lowercase().contains(q) ||
+                    t.albumName.lowercase().contains(q)
+            }
+        }
     }
 
     val isContextActive = remember(playbackState.contextUri, playbackState.itemUri, tracks, contextUri) {
@@ -96,12 +123,60 @@ fun CollectionDetailScreen(
                     .statusBarsPadding()
                     .padding(horizontal = SpotifyTokens.ScreenHorizontalPadding, vertical = 12.dp),
             ) {
-                IconButton(onClick = onBack) {
-                    Icon(
-                        imageVector = SpotifyIcons.Back,
-                        contentDescription = "Retour",
-                        tint = SpotifyTokens.TextPrimary,
-                    )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    IconButton(onClick = onBack) {
+                        Icon(
+                            imageVector = SpotifyIcons.Back,
+                            contentDescription = "Retour",
+                            tint = SpotifyTokens.TextPrimary,
+                        )
+                    }
+                    if (tracks.isNotEmpty()) {
+                        IconButton(onClick = {
+                            showSearch = !showSearch
+                            if (!showSearch) filterQuery = ""
+                        }) {
+                            Icon(
+                                imageVector = if (showSearch) SpotifyIcons.Close else SpotifyIcons.Search,
+                                contentDescription = "Filtrer les titres",
+                                tint = SpotifyTokens.TextPrimary,
+                            )
+                        }
+                    }
+                }
+
+                if (showSearch) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 12.dp)
+                            .height(40.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(SpotifyTokens.SurfaceElevated.copy(alpha = 0.9f))
+                            .padding(horizontal = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Box(modifier = Modifier.weight(1f)) {
+                            if (filterQuery.isEmpty()) {
+                                Text(
+                                    text = "Rechercher dans ${tracks.size} titres...",
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+                            BasicTextField(
+                                value = filterQuery,
+                                onValueChange = { filterQuery = it },
+                                singleLine = true,
+                                textStyle = MaterialTheme.typography.bodyMedium,
+                                cursorBrush = SolidColor(SpotifyTokens.AccentGreen),
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        }
+                    }
                 }
 
                 Box(
@@ -109,7 +184,7 @@ fun CollectionDetailScreen(
                     contentAlignment = Alignment.Center,
                 ) {
                     MediaArtwork(
-                        url = tracks.firstOrNull()?.artworkUrl,
+                        url = tracks.firstOrNull()?.artworkUrl ?: headerMeta.artworkUrl,
                         contentDescription = title,
                         size = 188.dp,
                         isLikedCollection = isLikedContext(contextUri),
@@ -124,7 +199,11 @@ fun CollectionDetailScreen(
                     style = MaterialTheme.typography.headlineLarge,
                 )
                 Text(
-                    text = "${tracks.size} titres",
+                    text = when {
+                        isRestricted && displayedCount > 0 -> "$displayedCount titres (détails masqués par Spotify)"
+                        isRestricted -> "Playlist externe Spotify"
+                        else -> "$displayedCount titres"
+                    },
                     style = MaterialTheme.typography.bodySmall,
                     modifier = Modifier.padding(top = 4.dp),
                 )
@@ -187,7 +266,68 @@ fun CollectionDetailScreen(
             }
         }
 
-        itemsIndexed(tracks, key = { idx, t -> "${t.uri}_$idx" }) { index, track ->
+        if (filteredTracks.isEmpty()) {
+            item(key = "empty_state") {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = SpotifyTokens.ScreenHorizontalPadding, vertical = 16.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(SpotifyTokens.SurfaceCard)
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    val activeSync = syncStatus as? SyncStatus.Syncing
+                    when {
+                        tracks.isNotEmpty() -> {
+                            Text(
+                                text = "Aucun titre ne correspond à « $filterQuery ».",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = SpotifyTokens.TextSecondary,
+                            )
+                        }
+                        activeSync != null -> {
+                            Text(
+                                text = activeSync.message,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = SpotifyTokens.AccentGreen,
+                            )
+                            LinearProgressIndicator(
+                                modifier = Modifier.fillMaxWidth(),
+                                color = SpotifyTokens.AccentGreen,
+                                trackColor = SpotifyTokens.SurfaceHighlight,
+                            )
+                        }
+                        isRestricted -> {
+                            Text(
+                                text = "Liste des titres restreinte par Spotify (Mode Développeur)",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = SpotifyTokens.TextPrimary,
+                            )
+                            Text(
+                                text = "Depuis février 2026, l'API Spotify autorise la lecture des titres uniquement pour les playlists dont vous êtes créateur ou collaborateur. Vous pouvez tout de même écouter cette playlist avec le bouton ▶ Lecture ou 🔀 Aléatoire ci-dessus.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = SpotifyTokens.TextSecondary,
+                            )
+                        }
+                        else -> {
+                            Text(
+                                text = "Aucun titre synchronisé pour cette collection.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = SpotifyTokens.TextSecondary,
+                            )
+                            OutlinedButton(
+                                onClick = { viewModel.refreshCollectionInBackground(contextUri) },
+                            ) {
+                                Text("Actualiser maintenant", color = SpotifyTokens.AccentGreen)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        itemsIndexed(filteredTracks, key = { _, (origIdx, t) -> "${t.uri}_$origIdx" }) { _, (index, track) ->
             val isActive = playbackState.itemUri == track.uri
             var menuExpanded by remember { mutableStateOf(false) }
 

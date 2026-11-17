@@ -22,8 +22,10 @@ import com.tristan.spotifyfast.player.PlaybackRouter
 import com.tristan.spotifyfast.player.PlaybackSessionService
 import com.tristan.spotifyfast.player.SpotifyConnectManager
 import kotlinx.serialization.json.Json
+import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.Response
 import retrofit2.Retrofit
 import retrofit2.converter.kotlinx.serialization.asConverterFactory
 import java.io.File
@@ -92,6 +94,7 @@ class AppContainer(context: Context) {
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(20, TimeUnit.SECONDS)
             .addInterceptor(SpotifyAuthInterceptor(tokenStore))
+            .addInterceptor(SpotifyRateLimitInterceptor())
             .authenticator(TokenRefreshAuthenticator(tokenStore, pkceAuthManager))
             .build()
     }
@@ -183,5 +186,33 @@ class AppContainer(context: Context) {
         ).also { router ->
             PlaybackSessionService.sessionController = router
         }
+    }
+}
+
+private class SpotifyRateLimitInterceptor(
+    private val maxRetries: Int = 3,
+) : Interceptor {
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        var response = chain.proceed(request)
+        var attempt = 0
+        while (attempt < maxRetries && (response.code == 429 || response.code in 502..504)) {
+            val retryAfterSeconds = response.header("Retry-After")?.trim()?.toLongOrNull()
+            val delayMs = if (retryAfterSeconds != null && retryAfterSeconds > 0L) {
+                (retryAfterSeconds * 1000L).coerceIn(500L, 10_000L)
+            } else {
+                (1000L * (attempt + 1)).coerceAtMost(5_000L)
+            }
+            response.close()
+            try {
+                Thread.sleep(delayMs)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw java.io.InterruptedIOException("Interrupted while waiting to retry Spotify request")
+            }
+            attempt++
+            response = chain.proceed(request)
+        }
+        return response
     }
 }

@@ -127,10 +127,18 @@ class SpotifyConnectManager(
                     )
                 isValidSpotifyContext -> StartPlaybackRequest(contextUri = contextUri)
                 fallbackTrackUris.isNotEmpty() -> {
-                    val capped = fallbackTrackUris.take(50)
-                    val offsetUri = uri?.takeIf { it in capped }
+                    val targetIdx = uri?.let { targetUri ->
+                        fallbackTrackUris.indexOfFirst { it == targetUri }.takeIf { it >= 0 }
+                    } ?: offsetIndex ?: 0
+                    val window = if (fallbackTrackUris.size <= 50) {
+                        fallbackTrackUris
+                    } else {
+                        val startIdx = (targetIdx - 5).coerceIn(0, fallbackTrackUris.size - 50)
+                        fallbackTrackUris.subList(startIdx, startIdx + 50)
+                    }
+                    val offsetUri = uri?.takeIf { it in window } ?: window.firstOrNull()
                     StartPlaybackRequest(
-                        uris = capped,
+                        uris = window,
                         offset = offsetUri?.let { PlaybackOffsetDto(uri = it) },
                     )
                 }

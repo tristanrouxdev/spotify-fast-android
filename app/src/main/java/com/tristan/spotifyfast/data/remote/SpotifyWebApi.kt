@@ -8,6 +8,7 @@ import retrofit2.http.POST
 import retrofit2.http.PUT
 import retrofit2.http.Path
 import retrofit2.http.Query
+import retrofit2.http.Url
 
 /**
  * Spotify Web API client aligned with the February 2026 Developer Mode endpoints
@@ -30,6 +31,12 @@ interface SpotifyWebApi {
         @Body body: CreatePlaylistRequest,
     ): PlaylistSimplifiedDto
 
+    @GET("v1/playlists/{id}")
+    suspend fun getPlaylist(
+        @Path("id") id: String,
+        @Query("additional_types") additionalTypes: String = "track,episode",
+    ): PlaylistFullDto
+
     @GET("v1/playlists/{id}/items")
     suspend fun getPlaylistItems(
         @Path("id") id: String,
@@ -44,9 +51,15 @@ interface SpotifyWebApi {
         @Query("offset") offset: Int = 0,
     ): PagingDto<PlaylistItemWrapperDto>
 
+    @GET
+    suspend fun getPlaylistItemsByUrl(
+        @Url nextUrl: String,
+    ): PagingDto<PlaylistItemWrapperDto>
+
     @GET("v1/me/following?type=artist")
     suspend fun getFollowedArtists(
         @Query("limit") limit: Int = 50,
+        @Query("after") after: String? = null,
     ): FollowedArtistsResponseDto
 
     @GET("v1/me/tracks")
@@ -63,6 +76,13 @@ interface SpotifyWebApi {
 
     @GET("v1/albums/{id}")
     suspend fun getAlbum(@Path("id") id: String): AlbumFullDto
+
+    @GET("v1/albums/{id}/tracks")
+    suspend fun getAlbumTracks(
+        @Path("id") id: String,
+        @Query("limit") limit: Int = 50,
+        @Query("offset") offset: Int = 0,
+    ): PagingDto<PlayableItemDto>
 
     @GET("v1/artists/{id}/top-tracks")
     suspend fun getArtistTopTracks(@Path("id") id: String): ArtistTopTracksDto

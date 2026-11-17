@@ -158,6 +158,7 @@ private fun SpotifyFastRoot(
     val lastAudioError by container.playbackRouter.lastErrorMessage.collectAsStateWithLifecycle()
     val needsSsoAuthorization by container.playbackRouter.needsSsoAuthorization.collectAsStateWithLifecycle()
     val syncStatus by container.syncEngine.syncStatus.collectAsStateWithLifecycle()
+    val followedArtistsPermissionMissing by container.syncEngine.followedArtistsPermissionMissing.collectAsStateWithLifecycle()
     val updateStatus by container.appUpdateManager.status.collectAsStateWithLifecycle()
 
     val context = LocalContext.current
@@ -531,6 +532,13 @@ private fun SpotifyFastRoot(
                 isAppRemoteConnected = isAppRemoteConnected,
                 needsSsoAuthorization = needsSsoAuthorization,
                 syncStatus = syncStatus,
+                followedArtistsPermissionMissing = followedArtistsPermissionMissing,
+                onReauthorizePermissions = {
+                    scope.launch {
+                        container.pkceAuthManager.authenticateWithCustomTabs(context, savedClientId)
+                            .onSuccess { container.syncEngine.syncAll() }
+                    }
+                },
                 lastAudioError = lastAudioError,
                 ssoFeedback = ssoFeedback,
                 githubRepo = githubRepo,

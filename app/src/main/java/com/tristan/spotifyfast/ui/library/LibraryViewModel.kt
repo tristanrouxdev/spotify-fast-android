@@ -7,6 +7,7 @@ import com.tristan.spotifyfast.data.local.ShowEpisodeEntity
 import com.tristan.spotifyfast.data.local.SpotifyDao
 import com.tristan.spotifyfast.data.local.TrackEntity
 import com.tristan.spotifyfast.data.sync.OfflineFirstSyncEngine
+import com.tristan.spotifyfast.data.sync.SyncStatus
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -63,6 +64,12 @@ data class LibraryUiState(
     val items: List<LibraryItemUi> = emptyList(),
 )
 
+data class CollectionHeaderMeta(
+    val dominantColorArgb: Int = DEFAULT_DOMINANT_COLOR,
+    val artworkUrl: String? = null,
+    val reportedTrackCount: Int = 0,
+)
+
 class LibraryViewModel(
     private val dao: SpotifyDao,
     private val syncEngine: OfflineFirstSyncEngine,
@@ -70,6 +77,8 @@ class LibraryViewModel(
     mainDispatcher: CoroutineDispatcher = Dispatchers.Main.immediate,
 ) {
     private val scope = CoroutineScope(SupervisorJob() + mainDispatcher)
+    val syncStatus: StateFlow<SyncStatus> = syncEngine.syncStatus
+    val restrictedPlaylistUris: StateFlow<Set<String>> = syncEngine.restrictedPlaylistUris
 
     private val filterFlow = MutableStateFlow(LibraryFilter.ALL)
     private val sortFlow = MutableStateFlow(LibrarySort.RECENTS)
@@ -97,11 +106,16 @@ class LibraryViewModel(
             updatedAtEpochMs = Long.MAX_VALUE,
         )
         playlists.forEach { p ->
+            val sub = if (p.trackCount > 0) {
+                "Playlist • ${p.trackCount} titres • ${p.ownerName}"
+            } else {
+                "Playlist • ${p.ownerName}"
+            }
             list += LibraryItemUi(
                 id = p.id,
                 uri = p.uri,
                 title = p.name,
-                subtitle = "Playlist • ${p.ownerName}",
+                subtitle = sub,
                 artworkUrl = p.artworkUrl,
                 kind = LibraryItemKind.PLAYLIST,
                 dominantColorArgb = p.dominantColorArgb,
@@ -247,18 +261,40 @@ class LibraryViewModel(
     fun observeAudiobookChapters(audiobookUri: String): Flow<List<AudiobookChapterEntity>> =
         dao.observeChaptersForAudiobook(audiobookUri)
 
-    suspend fun getDominantColorForUri(uri: String): Int {
-        return dao.getPlaylist(uri)?.dominantColorArgb
-            ?: dao.getAlbum(uri)?.dominantColorArgb
-            ?: dao.getShow(uri)?.dominantColorArgb
-            ?: dao.getAudiobook(uri)?.dominantColorArgb
-            ?: if (uri == LIKED_TRACKS_CONTEXT_URI) 0xFF450AF5.toInt() else DEFAULT_DOMINANT_COLOR
+    suspend fun getCollectionMeta(uri: String): CollectionHeaderMeta {
+        if (uri == LIKED_TRACKS_CONTEXT_URI) {
+            return CollectionHeaderMeta(dominantColorArgb = 0xFF450AF5.toInt())
+        }
+        dao.getPlaylist(uri)?.let { p ->
+            return CollectionHeaderMeta(
+                dominantColorArgb = p.dominantColorArgb,
+                artworkUrl = p.artworkUrl,
+                reportedTrackCount = p.trackCount,
+            )
+        }
+        dao.getAlbum(uri)?.let { a ->
+            return CollectionHeaderMeta(
+                dominantColorArgb = a.dominantColorArgb,
+                artworkUrl = a.artworkUrl,
+                reportedTrackCount = a.totalTracks,
+            )
+        }
+        dao.getShow(uri)?.let { s ->
+            return CollectionHeaderMeta(dominantColorArgb = s.dominantColorArgb, artworkUrl = s.artworkUrl)
+        }
+        dao.getAudiobook(uri)?.let { b ->
+            return CollectionHeaderMeta(dominantColorArgb = b.dominantColorArgb, artworkUrl = b.artworkUrl)
+        }
+        return CollectionHeaderMeta()
     }
+
+    suspend fun getDominantColorForUri(uri: String): Int = getCollectionMeta(uri).dominantColorArgb
 
     fun refreshCollectionInBackground(uri: String) {
         scope.launch(ioDispatcher) {
             val id = uri.substringAfterLast(":")
             when {
+                uri == LIKED_TRACKS_CONTEXT_URI -> runCatching { syncEngine.syncSavedTracks() }
                 uri.startsWith("spotify:playlist:") -> runCatching { syncEngine.syncPlaylistItems(id, uri) }
                 uri.startsWith("spotify:album:") -> runCatching { syncEngine.syncAlbumTracks(id, uri) }
                 uri.startsWith("spotify:artist:") -> runCatching { syncEngine.syncArtistTopTracks(id, uri) }
