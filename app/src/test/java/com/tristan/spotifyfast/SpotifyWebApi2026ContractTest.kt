@@ -173,7 +173,7 @@ class SpotifyWebApi2026ContractTest {
     fun `github app update manager parses release and compares semver cleanly`() = runTest {
         server.dispatcher = object : Dispatcher() {
             override fun dispatch(request: RecordedRequest): MockResponse {
-                return if (request.path == "/repos/tristanroux/spotify-fast-android/releases/latest") {
+                return if (request.path == "/repos/tristanrouxdev/spotify-fast-android/releases/latest") {
                     MockResponse().setResponseCode(200).setBody(
                         """
                         {
@@ -198,7 +198,7 @@ class SpotifyWebApi2026ContractTest {
             apiBaseUrl = server.url("/").toString(),
             currentVersionName = "1.1.0",
         )
-        val release = updater.fetchLatestRelease("tristanroux/spotify-fast-android").getOrThrow()
+        val release = updater.fetchLatestRelease("tristanrouxdev/spotify-fast-android").getOrThrow()
         assertEquals("v1.2.0", release.tagName)
         assertEquals("app-release.apk", release.assets.first().name)
         assertTrue(com.tristan.spotifyfast.update.AppUpdateManager.isNewerVersion("v1.2.0", "1.1.0"))

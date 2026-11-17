@@ -292,6 +292,6 @@ class EncryptedTokenStore(
         private val KEY_USER_PROFILE_NAME = stringPreferencesKey("spotify_user_name")
         private val KEY_USER_PRODUCT = stringPreferencesKey("spotify_user_product")
         private val KEY_GITHUB_REPO = stringPreferencesKey("github_repo_slug")
-        const val DEFAULT_GITHUB_REPO = "tristanroux/spotify-fast-android"
+        const val DEFAULT_GITHUB_REPO = "tristanrouxdev/spotify-fast-android"
     }
 }
