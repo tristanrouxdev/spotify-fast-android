@@ -1,5 +1,6 @@
 package com.tristan.spotifyfast.player
 
+import android.util.Log
 import com.tristan.spotifyfast.data.remote.PlaybackOffsetDto
 import com.tristan.spotifyfast.data.remote.PlaybackStateDto
 import com.tristan.spotifyfast.data.remote.SpotifyWebApi
@@ -7,6 +8,7 @@ import com.tristan.spotifyfast.data.remote.StartPlaybackRequest
 import com.tristan.spotifyfast.data.remote.TransferPlaybackRequest
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import retrofit2.Response
 
@@ -18,9 +20,25 @@ class SpotifyConnectManager(
     private val api: SpotifyWebApi,
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) {
+    private fun logInfo(msg: String) {
+        runCatching { Log.i(LOG_TAG, msg) }
+    }
+
+    private fun logError(msg: String, err: Throwable? = null) {
+        runCatching {
+            if (err != null) Log.e(LOG_TAG, msg, err) else Log.e(LOG_TAG, msg)
+        }
+    }
+
     private fun Response<Unit>.requireSuccess(action: String) {
         if (!isSuccessful) {
-            throw IllegalStateException("Spotify Connect $action failed (HTTP ${code()})")
+            val errBody = runCatching { errorBody()?.string() }.getOrNull()?.takeIf { it.isNotBlank() }
+            val msg = buildString {
+                append("Spotify Connect $action failed (HTTP ${code()})")
+                if (errBody != null) append(": $errBody")
+            }
+            logError(msg)
+            throw IllegalStateException(msg)
         }
     }
 
@@ -77,6 +95,7 @@ class SpotifyConnectManager(
         contextUri: String?,
         offsetIndex: Int?,
         fallbackTrackUris: List<String> = emptyList(),
+        onWakeLocalSpotify: (suspend () -> Unit)? = null,
     ): Result<Unit> = withContext(ioDispatcher) {
         runCatching {
             val isValidSpotifyContext = !contextUri.isNullOrBlank() &&
@@ -112,18 +131,38 @@ class SpotifyConnectManager(
 
             val resp = api.startOrResumePlayback(deviceId = deviceId, body = body)
             if (resp.code() == 404 && deviceId == null) {
-                val devices = fetchDevices().getOrDefault(emptyList())
-                val candidate = devices.firstOrNull { it.isActive }
-                    ?: devices.firstOrNull { it.type.equals("Smartphone", ignoreCase = true) }
-                    ?: devices.firstOrNull()
+                var candidate: ConnectDevice? = null
+                val maxAttempts = 4
+                for (attempt in 0 until maxAttempts) {
+                    val devices = fetchDevices().getOrDefault(emptyList())
+                    candidate = devices.firstOrNull { it.isActive }
+                        ?: devices.firstOrNull { it.type.equals("Smartphone", ignoreCase = true) }
+                        ?: devices.firstOrNull()
+                    if (candidate != null) break
+                    if (attempt < maxAttempts - 1 && onWakeLocalSpotify != null) {
+                        logInfo("Connect 404 (no device yet), waking Spotify (attempt ${attempt + 1}/$maxAttempts)")
+                        runCatching { onWakeLocalSpotify.invoke() }
+                        delay(350L)
+                    } else {
+                        break
+                    }
+                }
                 if (candidate != null) {
-                    api.transferPlayback(TransferPlaybackRequest(listOf(candidate.id), play = false))
+                    logInfo("Transferring Connect playback to ${candidate.name} (${candidate.id})")
+                    val transferResp = api.transferPlayback(
+                        TransferPlaybackRequest(listOf(candidate.id), play = false),
+                    )
+                    if (!transferResp.isSuccessful) {
+                        logError("Connect transfer before retry failed (HTTP ${transferResp.code()})")
+                    }
                     val retry = api.startOrResumePlayback(deviceId = candidate.id, body = body)
                     retry.requireSuccess("play(retry)")
                     return@runCatching
                 }
             }
             resp.requireSuccess("play")
+        }.onFailure { err ->
+            logError("playOnConnect failed: ${err.message}", err)
         }
     }
 
@@ -162,5 +201,9 @@ class SpotifyConnectManager(
 
     suspend fun addToQueue(uri: String): Result<Unit> = withContext(ioDispatcher) {
         runCatching { api.addToQueue(uri).requireSuccess("queue") }
+    }
+
+    companion object {
+        private const val LOG_TAG = "SpotifyFast"
     }
 }

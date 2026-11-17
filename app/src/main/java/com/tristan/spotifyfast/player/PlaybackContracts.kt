@@ -55,6 +55,7 @@ interface PlaybackController {
     val queue: StateFlow<List<QueueTrack>>
     val isAppRemoteConnected: StateFlow<Boolean>
     val lastErrorMessage: StateFlow<String?>
+    val needsSsoAuthorization: StateFlow<Boolean>
 
     suspend fun playUri(uri: String, contextUri: String? = null, offsetIndex: Int? = null)
     suspend fun toggleContextPlayback(contextUri: String)
@@ -87,6 +88,8 @@ interface LocalPlaybackTransport {
     fun setClientId(clientId: String)
     fun prewarm(clientId: String)
     fun isSpotifyInstalled(): Boolean
+    fun wakeSpotifyApp() {}
+    fun sendMediaKeyToSpotify(keyCode: Int) {}
     suspend fun reconnectNow(clientId: String): Result<Unit>
     suspend fun playUri(uri: String, contextUri: String? = null, offsetIndex: Int? = null): Result<Unit>
     suspend fun resume(): Result<Unit>

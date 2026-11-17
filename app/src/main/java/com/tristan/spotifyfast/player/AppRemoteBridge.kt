@@ -1,10 +1,18 @@
 package com.tristan.spotifyfast.player
 
+import android.content.ComponentName
 import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
+import android.os.IBinder
+import android.util.Log
+import android.view.KeyEvent
 import com.spotify.android.appremote.api.ConnectionParams
 import com.spotify.android.appremote.api.Connector
 import com.spotify.android.appremote.api.SpotifyAppRemote
+import com.spotify.android.appremote.api.error.AuthenticationFailedException
 import com.spotify.android.appremote.api.error.SpotifyDisconnectedException
+import com.spotify.android.appremote.api.error.UserNotAuthorizedException
 import com.spotify.protocol.client.CallResult
 import com.spotify.protocol.client.Subscription
 import com.spotify.protocol.types.PlaybackSpeed
@@ -73,34 +81,91 @@ class AppRemoteBridge(
         }
     }
 
+    private fun logInfo(msg: String) {
+        runCatching { Log.i(LOG_TAG, msg) }
+    }
+
+    private fun logError(msg: String, err: Throwable? = null) {
+        runCatching {
+            if (err != null) Log.e(LOG_TAG, msg, err) else Log.e(LOG_TAG, msg)
+        }
+    }
+
+    override fun wakeSpotifyApp() {
+        wakeSpotifyMediaService()
+    }
+
+    override fun sendMediaKeyToSpotify(keyCode: Int) {
+        logInfo("Sending MEDIA_BUTTON keyCode=$keyCode to $SPOTIFY_PACKAGE")
+        val target = ComponentName(SPOTIFY_PACKAGE, SPOTIFY_MEDIA_BUTTON_RECEIVER)
+        runCatching {
+            val down = Intent(Intent.ACTION_MEDIA_BUTTON).apply {
+                component = target
+                putExtra(Intent.EXTRA_KEY_EVENT, KeyEvent(KeyEvent.ACTION_DOWN, keyCode))
+            }
+            val up = Intent(Intent.ACTION_MEDIA_BUTTON).apply {
+                component = target
+                putExtra(Intent.EXTRA_KEY_EVENT, KeyEvent(KeyEvent.ACTION_UP, keyCode))
+            }
+            context.sendBroadcast(down)
+            context.sendBroadcast(up)
+        }.onFailure { err ->
+            logError("sendMediaKeyToSpotify($keyCode) failed", err)
+        }
+    }
+
     override suspend fun reconnectNow(clientId: String): Result<Unit> {
         setClientId(clientId)
+        logInfo("Manual AppRemote reconnect requested")
         wakeSpotifyMediaService()
         delay(300L)
         val remote = ensureConnected()
         return if (remote != null) {
+            logInfo("Manual AppRemote reconnect succeeded")
             Result.success(Unit)
         } else {
-            Result.failure(
-                IllegalStateException(
-                    _lastConnectionError.value
-                        ?: "Impossible de se connecter à Spotify. Vérifiez l'empreinte SHA-1 dans votre Dashboard Spotify Developer.",
-                ),
-            )
+            val errMsg = _lastConnectionError.value
+                ?: "Impossible de se connecter à Spotify. Vérifiez l'empreinte SHA-1 dans votre Dashboard Spotify Developer."
+            logError("Manual AppRemote reconnect failed: $errMsg")
+            Result.failure(IllegalStateException(errMsg))
         }
     }
 
     private fun wakeSpotifyMediaService() {
+        logInfo("Waking $SPOTIFY_PACKAGE receivers & protocol service")
         runCatching {
-            val down = android.content.Intent(android.content.Intent.ACTION_MEDIA_BUTTON).apply {
-                setPackage("com.spotify.music")
-                putExtra(
-                    android.content.Intent.EXTRA_KEY_EVENT,
-                    android.view.KeyEvent(android.view.KeyEvent.ACTION_DOWN, android.view.KeyEvent.KEYCODE_MEDIA_PAUSE),
-                )
+            val prepareIntent = Intent("com.spotify.music.ACTION_PREPARE").apply {
+                component = ComponentName(SPOTIFY_PACKAGE, SPOTIFY_ALARM_RECEIVER)
             }
-            context.sendBroadcast(down)
-        }
+            context.sendBroadcast(prepareIntent)
+        }.onFailure { logError("ACTION_PREPARE broadcast failed", it) }
+
+        runCatching {
+            val initIntent = Intent("com.waze.sdk.audio.ACTION_INIT").apply {
+                component = ComponentName(SPOTIFY_PACKAGE, SPOTIFY_WAZE_WAKEUP_RECEIVER)
+            }
+            context.sendBroadcast(initIntent)
+        }.onFailure { logError("ACTION_INIT broadcast failed", it) }
+
+        runCatching {
+            val svcIntent = Intent("com.spotify.mobile.appprotocol.action.START_APP_PROTOCOL_SERVICE").apply {
+                setPackage(SPOTIFY_PACKAGE)
+            }
+            val conn = object : ServiceConnection {
+                override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+                    runCatching { context.applicationContext.unbindService(this) }
+                }
+
+                override fun onServiceDisconnected(name: ComponentName?) {}
+            }
+            val bound = context.applicationContext.bindService(svcIntent, conn, Context.BIND_AUTO_CREATE)
+            if (bound) {
+                scope.launch {
+                    delay(1_500L)
+                    runCatching { context.applicationContext.unbindService(conn) }
+                }
+            }
+        }.onFailure { logError("Brief START_APP_PROTOCOL_SERVICE bind failed", it) }
     }
 
     private suspend fun ensureConnected(): SpotifyAppRemote? = connectMutex.withLock {
@@ -110,9 +175,13 @@ class AppRemoteBridge(
         }
         val clientId = currentClientId?.takeIf { it.isNotBlank() } ?: return@withLock null
         if (!isSpotifyInstalled()) {
-            _lastConnectionError.value = "Application Spotify officielle introuvable sur cet appareil."
+            val msg = "Application Spotify officielle introuvable sur cet appareil."
+            _lastConnectionError.value = msg
+            logError(msg)
             return@withLock null
         }
+
+        wakeSpotifyMediaService()
 
         val params = ConnectionParams.Builder(clientId)
             .setRedirectUri(redirectUri)
@@ -139,12 +208,19 @@ class AppRemoteBridge(
             _isConnected.value = true
             _lastConnectionError.value = null
             reconnectAttempt = 0
+            logInfo("AppRemote connected successfully")
             subscribeToStreams(remote)
             remote
         }.onFailure { err ->
             _isConnected.value = false
-            _lastConnectionError.value = err.message ?: err.javaClass.simpleName
-            scheduleExponentialReconnect()
+            val formatted = "${err.javaClass.simpleName}: ${err.message ?: err.toString()}"
+            _lastConnectionError.value = formatted
+            logError("AppRemote connect failed: $formatted", err)
+            if (err !is UserNotAuthorizedException && err !is AuthenticationFailedException) {
+                scheduleExponentialReconnect()
+            } else {
+                logInfo("Stopping auto-reconnect loop after auth error (${err.javaClass.simpleName})")
+            }
         }.getOrNull()
     }
 
@@ -193,6 +269,7 @@ class AppRemoteBridge(
                 repeatMode = repeat,
             )
         }.setErrorCallback { err ->
+            logError("AppRemote playerState subscription error", err)
             if (err is SpotifyDisconnectedException) {
                 _isConnected.value = false
                 appRemote = null
@@ -219,6 +296,7 @@ class AppRemoteBridge(
         if (firstAttempt.isSuccess) return Result.success(Unit)
 
         val err = firstAttempt.exceptionOrNull()
+        logError("AppRemote command failed on first attempt", err)
         if (err is SpotifyDisconnectedException || !firstRemote.isConnected) {
             appRemote = null
             _isConnected.value = false
@@ -227,6 +305,8 @@ class AppRemoteBridge(
             return runCatching {
                 awaitCallResult(block(reconnected))
                 Unit
+            }.onFailure { retryErr ->
+                logError("AppRemote command retry failed", retryErr)
             }
         }
         return Result.failure(err ?: IllegalStateException("Erreur App Remote"))
@@ -298,6 +378,45 @@ class AppRemoteBridge(
     }
 
     companion object {
+        private const val LOG_TAG = "SpotifyFast"
+        private const val SPOTIFY_PACKAGE = "com.spotify.music"
+        private const val SPOTIFY_MEDIA_BUTTON_RECEIVER =
+            "com.spotify.mediasession.mediasession.receiver.MediaButtonReceiver"
+        private const val SPOTIFY_ALARM_RECEIVER =
+            "com.spotify.music.alarmlauncher.SpotifyAlarmLauncherReceiver"
+        private const val SPOTIFY_WAZE_WAKEUP_RECEIVER =
+            "com.spotify.carmobile.wazesdk.navigation.WazeWakeUpReceiver"
+
+        fun buildNativeSsoAuthIntent(
+            context: Context,
+            clientId: String,
+            redirectUri: String = "http://127.0.0.1:8888/callback",
+        ): Intent? {
+            val cleanClientId = clientId.trim()
+            if (cleanClientId.isBlank()) return null
+            val intent = Intent("com.spotify.sso.action.START_AUTH_FLOW").apply {
+                setPackage(SPOTIFY_PACKAGE)
+                putExtra("VERSION", 1)
+                putExtra("CLIENT_ID", cleanClientId)
+                putExtra("REDIRECT_URI", redirectUri)
+                putExtra("RESPONSE_TYPE", "code")
+                putExtra(
+                    "SCOPES",
+                    arrayOf(
+                        "app-remote-control",
+                        "streaming",
+                        "user-read-playback-state",
+                        "user-modify-playback-state",
+                        "user-read-currently-playing",
+                    ),
+                )
+                putExtra("UTM_SOURCE", "spotify-sdk")
+                putExtra("UTM_MEDIUM", "android-sdk")
+                putExtra("UTM_CAMPAIGN", "android-sdk")
+            }
+            return if (intent.resolveActivity(context.packageManager) != null) intent else null
+        }
+
         fun spotifyImageUriToHttps(raw: String?): String? {
             if (raw.isNullOrBlank()) return null
             return if (raw.startsWith("spotify:image:")) {

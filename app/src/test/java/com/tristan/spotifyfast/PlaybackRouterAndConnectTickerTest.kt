@@ -55,13 +55,25 @@ private class FakeLocalTransport : LocalPlaybackTransport {
     var speedCalls = mutableListOf<Float>()
     var resumeCount = 0
     var pauseCount = 0
+    var shouldFailPlay = false
+    var wakeCount = 0
+    val mediaKeys = mutableListOf<Int>()
+
+    fun emitConnectionError(msg: String?) {
+        _lastConnectionError.value = msg
+    }
 
     override fun setClientId(clientId: String) {}
     override fun prewarm(clientId: String) {}
     override fun isSpotifyInstalled(): Boolean = true
+    override fun wakeSpotifyApp() { wakeCount++ }
+    override fun sendMediaKeyToSpotify(keyCode: Int) { mediaKeys += keyCode }
     override suspend fun reconnectNow(clientId: String): Result<Unit> = Result.success(Unit)
 
     override suspend fun playUri(uri: String, contextUri: String?, offsetIndex: Int?): Result<Unit> {
+        if (shouldFailPlay) {
+            return Result.failure(IllegalStateException("AppRemote unauthorized"))
+        }
         playedCalls += Triple(uri, contextUri, offsetIndex)
         return Result.success(Unit)
     }
@@ -335,5 +347,63 @@ class PlaybackRouterAndConnectTickerTest {
         assertTrue(res.isSuccess)
         assertTrue(restPlayBodies.last().contains("spotify:track:liked_1"))
         assertFalse(restPlayBodies.last().contains("spotify:collection:tracks"))
+    }
+
+    @Test
+    fun `local play failure wakes spotify media session, polls connect devices, and flags sso authorization`() = runTest {
+        val devicePollAttempts = AtomicInteger(0)
+        val targetedPhonePlay = AtomicInteger(0)
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                val p = request.path.orEmpty()
+                return when {
+                    p.startsWith("/v1/me/player/play") -> {
+                        val query = request.requestUrl?.queryParameter("device_id")
+                        if (query == "phone_xiaomi") {
+                            targetedPhonePlay.incrementAndGet()
+                            MockResponse().setResponseCode(204)
+                        } else {
+                            MockResponse().setResponseCode(404)
+                        }
+                    }
+                    p.startsWith("/v1/me/player/devices") -> {
+                        val count = devicePollAttempts.incrementAndGet()
+                        if (count < 2) {
+                            MockResponse().setResponseCode(200).setBody("""{"devices":[]}""")
+                        } else {
+                            MockResponse().setResponseCode(200).setBody(
+                                """{"devices":[{"id":"phone_xiaomi","name":"Xiaomi 11T","type":"Smartphone","is_active":false,"volume_percent":85}]}""",
+                            )
+                        }
+                    }
+                    else -> MockResponse().setResponseCode(204)
+                }
+            }
+        }
+
+        val fakeLocal = FakeLocalTransport().apply { shouldFailPlay = true }
+        val ioDispatcher = StandardTestDispatcher(testScheduler)
+        val router = PlaybackRouter(
+            dao = db.spotifyDao(),
+            localTransport = fakeLocal,
+            connectManager = SpotifyConnectManager(api, ioDispatcher),
+            syncEngine = OfflineFirstSyncEngine(db.spotifyDao(), api, tokenStore, ioDispatcher = ioDispatcher),
+            tokenStore = tokenStore,
+            ioDispatcher = ioDispatcher,
+            enableBackgroundPolling = false,
+        )
+
+        fakeLocal.emitConnectionError("""UserNotAuthorizedException: {"message":"Explicit user authorization is required"}""")
+        advanceUntilIdle()
+        assertTrue(router.needsSsoAuthorization.value)
+
+        router.playUri("spotify:track:wake_1", "spotify:playlist:wake_pl", 0)
+        advanceUntilIdle()
+
+        assertTrue(fakeLocal.wakeCount >= 2)
+        assertTrue(fakeLocal.mediaKeys.contains(android.view.KeyEvent.KEYCODE_MEDIA_PLAY))
+        assertTrue(devicePollAttempts.get() >= 2)
+        assertEquals(1, targetedPhonePlay.get())
+        assertTrue(router.playbackState.value.isPlaying)
     }
 }

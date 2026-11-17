@@ -1,5 +1,6 @@
 package com.tristan.spotifyfast.data.sync
 
+import android.util.Log
 import com.tristan.spotifyfast.auth.EncryptedTokenStore
 import com.tristan.spotifyfast.data.local.AlbumEntity
 import com.tristan.spotifyfast.data.local.ArtistEntity
@@ -39,6 +40,10 @@ class OfflineFirstSyncEngine(
 ) {
     private val syncMutex = Mutex()
 
+    private fun logError(msg: String, err: Throwable) {
+        runCatching { Log.e("SpotifyFast", msg, err) }
+    }
+
     suspend fun syncAll(): Result<Unit> = withContext(ioDispatcher) {
         syncMutex.withLock {
             val bundle = tokenStore.loadTokenBundle()
@@ -51,16 +56,21 @@ class OfflineFirstSyncEngine(
             }
 
             runCatching {
-                runCatching { api.getCurrentProfile() }.getOrNull()?.let { profile ->
-                    tokenStore.saveUserProfile(
-                        name = profile.displayName?.takeIf { it.isNotBlank() } ?: profile.id,
-                        product = profile.product ?: "premium",
-                    )
-                }
+                runCatching { api.getCurrentProfile() }
+                    .onFailure { logError("Sync getCurrentProfile failed", it) }
+                    .getOrNull()
+                    ?.let { profile ->
+                        tokenStore.saveUserProfile(
+                            name = profile.displayName?.takeIf { it.isNotBlank() } ?: profile.id,
+                            product = profile.product ?: "premium",
+                        )
+                    }
 
                 val existingPlaylists = dao.getAllPlaylistsOnce().associateBy { it.id }
 
-                val playlists = runCatching { api.getUserPlaylists(limit = 50).items }.getOrNull()
+                val playlists = runCatching { api.getUserPlaylists(limit = 50).items }
+                    .onFailure { logError("Sync getUserPlaylists failed", it) }
+                    .getOrNull()
                 if (playlists != null) {
                     val playlistEntities = playlists.mapIndexed { index, dto ->
                         val existing = existingPlaylists[dto.id]

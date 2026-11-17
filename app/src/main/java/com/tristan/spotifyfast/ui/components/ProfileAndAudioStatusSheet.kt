@@ -37,6 +37,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.tristan.spotifyfast.BuildConfig
+import com.tristan.spotifyfast.auth.PkceAuthManager
 import com.tristan.spotifyfast.ui.theme.SpotifyTokens
 import com.tristan.spotifyfast.update.UpdateStatus
 import java.io.File
@@ -49,7 +50,9 @@ fun ProfileAndAudioStatusSheet(
     clientId: String,
     isDemoMode: Boolean,
     isAppRemoteConnected: Boolean,
+    needsSsoAuthorization: Boolean = false,
     lastAudioError: String?,
+    ssoFeedback: String? = null,
     githubRepo: String,
     updateStatus: UpdateStatus,
     onCheckAndInstallUpdate: (repoSlug: String, force: Boolean) -> Unit,
@@ -259,11 +262,21 @@ fun ProfileAndAudioStatusSheet(
                     )
                 }
 
-                if (!lastAudioError.isNullOrBlank()) {
+                val errorToDisplay = ssoFeedback ?: lastAudioError
+                if (!errorToDisplay.isNullOrBlank()) {
                     Text(
-                        text = lastAudioError,
+                        text = errorToDisplay,
                         style = MaterialTheme.typography.bodySmall,
                         color = SpotifyTokens.ErrorRed,
+                    )
+                }
+
+                if (!isDemoMode && !isAppRemoteConnected) {
+                    val appSha1 = remember(context) { PkceAuthManager.readAppSigningSha1(context) }
+                    Text(
+                        text = "Package : ${context.packageName} • SHA-1 : $appSha1",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = SpotifyTokens.TextSecondary,
                     )
                 }
 
@@ -272,12 +285,16 @@ fun ProfileAndAudioStatusSheet(
                         onClick = onReconnectSpotify,
                         modifier = Modifier.fillMaxWidth(),
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = SpotifyTokens.SurfaceHighlight,
-                            contentColor = SpotifyTokens.TextPrimary,
+                            containerColor = if (needsSsoAuthorization) SpotifyTokens.AccentGreen else SpotifyTokens.SurfaceHighlight,
+                            contentColor = if (needsSsoAuthorization) Color.Black else SpotifyTokens.TextPrimary,
                         ),
                     ) {
                         Text(
-                            text = if (isAppRemoteConnected) "Vérifier / Actualiser le pont audio" else "Connecter l'application Spotify",
+                            text = when {
+                                isAppRemoteConnected -> "Vérifier / Actualiser le pont audio"
+                                needsSsoAuthorization -> "Connecter l'application Spotify (Autoriser SSO)"
+                                else -> "Connecter l'application Spotify"
+                            },
                             fontWeight = FontWeight.SemiBold,
                         )
                     }

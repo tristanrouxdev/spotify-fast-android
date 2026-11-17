@@ -1,10 +1,14 @@
 package com.tristan.spotifyfast
 
+import android.app.Activity
 import android.net.Uri
 import android.os.Bundle
+import android.util.Log
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -39,6 +43,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -48,6 +53,8 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
+import com.tristan.spotifyfast.auth.PkceAuthManager
+import com.tristan.spotifyfast.player.AppRemoteBridge
 import com.tristan.spotifyfast.player.RepeatMode
 import com.tristan.spotifyfast.ui.components.MiniPlayerBar
 import com.tristan.spotifyfast.ui.components.ProfileAndAudioStatusSheet
@@ -149,7 +156,78 @@ private fun SpotifyFastRoot(
     val queue by container.playbackRouter.queue.collectAsStateWithLifecycle()
     val isAppRemoteConnected by container.playbackRouter.isAppRemoteConnected.collectAsStateWithLifecycle()
     val lastAudioError by container.playbackRouter.lastErrorMessage.collectAsStateWithLifecycle()
+    val needsSsoAuthorization by container.playbackRouter.needsSsoAuthorization.collectAsStateWithLifecycle()
     val updateStatus by container.appUpdateManager.status.collectAsStateWithLifecycle()
+
+    val context = LocalContext.current
+    var ssoFeedback by remember { mutableStateOf<String?>(null) }
+
+    val ssoLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
+        val extraKeys = result.data?.extras?.keySet()?.joinToString(",").orEmpty()
+        Log.i("SpotifyFast", "Native SSO resultCode=${result.resultCode}, extraKeys=[$extraKeys]")
+        when (result.resultCode) {
+            Activity.RESULT_OK -> {
+                ssoFeedback = null
+                Log.i("SpotifyFast", "Native SSO authorized, reconnecting App Remote")
+                scope.launch { container.playbackRouter.reconnectSpotifyApp(savedClientId) }
+            }
+            -2 -> { // Spotify LoginActivity.RESULT_ERROR
+                val rawErr = result.data?.getStringExtra("ERROR") ?: "Erreur autorisation Spotify"
+                Log.e("SpotifyFast", "Native SSO error (-2): $rawErr")
+                val sha1 = PkceAuthManager.readAppSigningSha1(context)
+                ssoFeedback = if (
+                    rawErr.contains("INVALID", ignoreCase = true) ||
+                    rawErr.contains("APP_ID", ignoreCase = true) ||
+                    rawErr.contains("AUTHENTICATION", ignoreCase = true)
+                ) {
+                    "Spotify App Remote a retourné : $rawErr.\n" +
+                        "Pour App Remote, ajoutez dans Spotify Developer Dashboard :\n" +
+                        "• Package Android : ${context.packageName}\n" +
+                        "• Empreinte SHA-1 : $sha1\n" +
+                        "Le mode Spotify Connect Web API prend automatiquement le relais sans SHA-1 si l'app Spotify a une session active."
+                } else {
+                    "Erreur autorisation Spotify ($rawErr)"
+                }
+            }
+            Activity.RESULT_CANCELED -> {
+                Log.w("SpotifyFast", "Native SSO cancelled (resultCode=0)")
+                ssoFeedback = "Autorisation Spotify annulée ou bloquée (vérifiez Package=${context.packageName} / SHA-1 dans votre Dashboard Spotify)."
+            }
+        }
+    }
+
+    val launchNativeSsoOrReconnect: () -> Unit = {
+        val currentErr = lastAudioError.orEmpty()
+        val shouldLaunchSso = needsSsoAuthorization ||
+            currentErr.contains("Explicit user authorization", ignoreCase = true) ||
+            currentErr.contains("UserNotAuthorizedException", ignoreCase = true)
+
+        if (shouldLaunchSso) {
+            val ssoIntent = AppRemoteBridge.buildNativeSsoAuthIntent(
+                context = context,
+                clientId = savedClientId,
+                redirectUri = container.pkceAuthManager.redirectUri(),
+            )
+            if (ssoIntent != null) {
+                Log.i("SpotifyFast", "Launching foreground Spotify SSO intent (START_AUTH_FLOW)")
+                ssoFeedback = null
+                runCatching {
+                    ssoLauncher.launch(ssoIntent)
+                }.onFailure { err ->
+                    Log.e("SpotifyFast", "Unable to start foreground SSO intent", err)
+                    ssoFeedback = "Impossible d'ouvrir l'écran d'autorisation Spotify : ${err.message}"
+                    scope.launch { container.playbackRouter.reconnectSpotifyApp(savedClientId) }
+                }
+            } else {
+                Log.w("SpotifyFast", "Native START_AUTH_FLOW intent did not resolve, falling back to reconnectSpotifyApp")
+                scope.launch { container.playbackRouter.reconnectSpotifyApp(savedClientId) }
+            }
+        } else {
+            scope.launch { container.playbackRouter.reconnectSpotifyApp(savedClientId) }
+        }
+    }
 
     var showNowPlaying by remember { mutableStateOf(false) }
     var showDevicesSheet by remember { mutableStateOf(false) }
@@ -198,6 +276,11 @@ private fun SpotifyFastRoot(
                                 modifier = Modifier.weight(1f),
                             )
                             Spacer(modifier = Modifier.width(6.dp))
+                            if (needsSsoAuthorization) {
+                                TextButton(onClick = launchNativeSsoOrReconnect) {
+                                    Text("Autoriser", color = Color.White, fontWeight = FontWeight.Bold)
+                                }
+                            }
                             TextButton(
                                 onClick = {
                                     container.playbackRouter.clearError()
@@ -446,7 +529,9 @@ private fun SpotifyFastRoot(
                 clientId = savedClientId,
                 isDemoMode = isDemoMode,
                 isAppRemoteConnected = isAppRemoteConnected,
+                needsSsoAuthorization = needsSsoAuthorization,
                 lastAudioError = lastAudioError,
+                ssoFeedback = ssoFeedback,
                 githubRepo = githubRepo,
                 updateStatus = updateStatus,
                 onCheckAndInstallUpdate = { repoSlug, force ->
@@ -458,9 +543,7 @@ private fun SpotifyFastRoot(
                 onInstallReadyApk = { apkFile ->
                     container.appUpdateManager.launchApkInstaller(apkFile)
                 },
-                onReconnectSpotify = {
-                    scope.launch { container.playbackRouter.reconnectSpotifyApp(savedClientId) }
-                },
+                onReconnectSpotify = launchNativeSsoOrReconnect,
                 onSyncNow = {
                     scope.launch { container.syncEngine.syncAll() }
                 },

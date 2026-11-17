@@ -1,6 +1,8 @@
 package com.tristan.spotifyfast.player
 
 import android.os.SystemClock
+import android.util.Log
+import android.view.KeyEvent
 import com.tristan.spotifyfast.auth.EncryptedTokenStore
 import com.tristan.spotifyfast.data.local.DEFAULT_DOMINANT_COLOR
 import com.tristan.spotifyfast.data.local.PlaybackSnapshotEntity
@@ -15,9 +17,13 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.firstOrNull
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
@@ -55,8 +61,26 @@ class PlaybackRouter(
 
     override val isAppRemoteConnected: StateFlow<Boolean> = localTransport.isConnected
 
-    private val _lastErrorMessage = MutableStateFlow<String?>(null)
-    override val lastErrorMessage: StateFlow<String?> = _lastErrorMessage.asStateFlow()
+    private val _playbackError = MutableStateFlow<String?>(null)
+    private val _dismissedConnectionError = MutableStateFlow<String?>(null)
+
+    override val needsSsoAuthorization: StateFlow<Boolean> =
+        localTransport.lastConnectionError
+            .map { err ->
+                err != null && (
+                    err.contains("Explicit user authorization", ignoreCase = true) ||
+                        err.contains("UserNotAuthorizedException", ignoreCase = true)
+                    )
+            }
+            .stateIn(scope, SharingStarted.Eagerly, false)
+
+    override val lastErrorMessage: StateFlow<String?> = combine(
+        _playbackError,
+        localTransport.lastConnectionError,
+        _dismissedConnectionError,
+    ) { playErr, connErr, dismissed ->
+        playErr ?: connErr?.takeIf { it != dismissed }
+    }.stateIn(scope, SharingStarted.Eagerly, null)
 
     private var tickerJob: Job? = null
     private var pollJob: Job? = null
@@ -138,8 +162,15 @@ class PlaybackRouter(
         }
     }
 
+    private fun logError(msg: String, err: Throwable? = null) {
+        runCatching {
+            if (err != null) Log.e("SpotifyFast", msg, err) else Log.e("SpotifyFast", msg)
+        }
+    }
+
     override fun clearError() {
-        _lastErrorMessage.value = null
+        _playbackError.value = null
+        _dismissedConnectionError.value = localTransport.lastConnectionError.value
     }
 
     fun startPostFrameWarmup(clientId: String) {
@@ -153,11 +184,14 @@ class PlaybackRouter(
     }
 
     override suspend fun reconnectSpotifyApp(clientId: String): Result<Unit> {
+        _dismissedConnectionError.value = null
         val result = localTransport.reconnectNow(clientId)
         result.onFailure { err ->
-            _lastErrorMessage.value = err.message ?: "Connexion à l'application Spotify impossible"
+            val msg = err.message ?: "Connexion à l'application Spotify impossible"
+            logError("reconnectSpotifyApp failed: $msg", err)
+            _playbackError.value = msg
         }.onSuccess {
-            _lastErrorMessage.value = null
+            _playbackError.value = null
         }
         return result
     }
@@ -395,7 +429,7 @@ class PlaybackRouter(
     }
 
     override suspend fun playUri(uri: String, contextUri: String?, offsetIndex: Int?) {
-        _lastErrorMessage.value = null
+        _playbackError.value = null
         if (isDemoMode()) {
             val optimistic = buildOptimisticState(uri, contextUri, playing = true)
             applyUpdatedState(optimistic)
@@ -408,7 +442,10 @@ class PlaybackRouter(
         val contextTracks = contextUri?.let { dao.getTracksForContextOnce(it) }.orEmpty()
         val fallbackTrackUris = contextTracks.map { it.uri }
 
-        var succeeded = false
+        // Immediate optimistic state update (< 16 ms) so playlist Play button and MiniPlayerBar toggle immediately
+        val optimistic = buildOptimisticState(uri, contextUri, playing = true)
+        applyUpdatedState(optimistic)
+
         if (current.isRemoteConnect) {
             val remoteRes = connectManager.playOnConnect(
                 deviceId = current.activeDevice?.id,
@@ -417,12 +454,15 @@ class PlaybackRouter(
                 offsetIndex = offsetIndex,
                 fallbackTrackUris = fallbackTrackUris,
             )
-            succeeded = remoteRes.isSuccess
-            if (!succeeded) {
-                _lastErrorMessage.value = remoteRes.exceptionOrNull()?.message
-                    ?: "Lecture impossible sur l'appareil Connect"
-            } else {
+            if (remoteRes.isSuccess) {
+                _dismissedConnectionError.value = localTransport.lastConnectionError.value
                 syncPlaybackFromConnectOnce()
+            } else {
+                val msg = remoteRes.exceptionOrNull()?.message
+                    ?: "Lecture impossible sur l'appareil Connect"
+                logError("Remote playUri failed: $msg")
+                _playbackError.value = msg
+                applyUpdatedState(_playbackState.value.copy(isPlaying = false))
             }
         } else {
             val resolvedIndex = if (contextUri != null && offsetIndex == null) {
@@ -432,26 +472,42 @@ class PlaybackRouter(
             }
             val localRes = localTransport.playUri(uri, contextUri, resolvedIndex)
             if (localRes.isSuccess) {
-                succeeded = true
+                _dismissedConnectionError.value = localTransport.lastConnectionError.value
             } else {
+                val wakeLocalSpotify: suspend () -> Unit = {
+                    localTransport.wakeSpotifyApp()
+                    localTransport.sendMediaKeyToSpotify(KeyEvent.KEYCODE_MEDIA_PLAY)
+                }
+                wakeLocalSpotify()
                 val restRes = connectManager.playOnConnect(
                     deviceId = null,
                     uri = uri,
                     contextUri = contextUri,
                     offsetIndex = resolvedIndex,
                     fallbackTrackUris = fallbackTrackUris,
+                    onWakeLocalSpotify = wakeLocalSpotify,
                 )
-                succeeded = restRes.isSuccess
-                if (!succeeded) {
-                    _lastErrorMessage.value =
-                        "Spotify n'a pas pu démarrer la lecture. Ouvrez Spotify ou touchez votre profil → Connecter Spotify."
+                if (restRes.isSuccess) {
+                    _dismissedConnectionError.value = localTransport.lastConnectionError.value
+                    scope.launch {
+                        delay(600L)
+                        refreshDevices()
+                        syncPlaybackFromConnectOnce()
+                    }
+                } else {
+                    val localErr = localRes.exceptionOrNull()?.message
+                    val restErr = restRes.exceptionOrNull()?.message
+                    logError("playUri failed completely: local=$localErr | rest=$restErr")
+                    _dismissedConnectionError.value = null
+                    _playbackError.value = if (needsSsoAuthorization.value) {
+                        "Autorisation SSO Spotify requise pour lire l'audio. Touchez Autoriser."
+                    } else {
+                        restErr ?: localErr
+                            ?: "Spotify n'a pas pu démarrer la lecture. Ouvrez Spotify ou touchez votre profil → Autoriser Spotify."
+                    }
+                    applyUpdatedState(_playbackState.value.copy(isPlaying = false))
                 }
             }
-        }
-
-        if (succeeded) {
-            val optimistic = buildOptimisticState(uri, contextUri, playing = true)
-            applyUpdatedState(optimistic)
         }
     }
 
@@ -494,6 +550,8 @@ class PlaybackRouter(
         }
 
         ensureClientIdLoaded()
+        applyUpdatedState(current.copy(isPlaying = nextPlaying))
+
         val result = if (current.isRemoteConnect) {
             val deviceId = current.activeDevice?.id
             if (nextPlaying) connectManager.playOnConnect(deviceId, null, null, null)
@@ -501,18 +559,33 @@ class PlaybackRouter(
         } else {
             val localRes = if (nextPlaying) localTransport.resume() else localTransport.pause()
             if (localRes.isFailure) {
-                if (nextPlaying) connectManager.playOnConnect(null, null, null, null)
-                else connectManager.pause(null)
+                if (nextPlaying) {
+                    val wakeLocalSpotify: suspend () -> Unit = {
+                        localTransport.wakeSpotifyApp()
+                        localTransport.sendMediaKeyToSpotify(KeyEvent.KEYCODE_MEDIA_PLAY)
+                    }
+                    wakeLocalSpotify()
+                    connectManager.playOnConnect(null, null, null, null, onWakeLocalSpotify = wakeLocalSpotify)
+                } else {
+                    connectManager.pause(null)
+                }
             } else {
                 localRes
             }
         }
 
         if (result.isSuccess) {
-            _lastErrorMessage.value = null
-            applyUpdatedState(current.copy(isPlaying = nextPlaying))
+            _playbackError.value = null
+            _dismissedConnectionError.value = localTransport.lastConnectionError.value
         } else {
-            _lastErrorMessage.value = "Impossible de basculer la lecture Spotify."
+            val errMsg = result.exceptionOrNull()?.message ?: "Impossible de basculer la lecture Spotify."
+            logError("togglePlayPause failed: $errMsg")
+            _playbackError.value = if (needsSsoAuthorization.value) {
+                "Autorisation SSO Spotify requise pour contrôler la lecture."
+            } else {
+                errMsg
+            }
+            applyUpdatedState(_playbackState.value.copy(isPlaying = current.isPlaying))
         }
     }
 
