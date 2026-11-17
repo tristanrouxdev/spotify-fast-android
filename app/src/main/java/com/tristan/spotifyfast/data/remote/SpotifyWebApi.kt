@@ -37,6 +37,18 @@ interface SpotifyWebApi {
         @Query("offset") offset: Int = 0,
     ): PagingDto<PlaylistItemWrapperDto>
 
+    @GET("v1/playlists/{id}/tracks")
+    suspend fun getPlaylistTracks(
+        @Path("id") id: String,
+        @Query("limit") limit: Int = 50,
+        @Query("offset") offset: Int = 0,
+    ): PagingDto<PlaylistItemWrapperDto>
+
+    @GET("v1/me/following?type=artist")
+    suspend fun getFollowedArtists(
+        @Query("limit") limit: Int = 50,
+    ): FollowedArtistsResponseDto
+
     @GET("v1/me/tracks")
     suspend fun getSavedTracks(
         @Query("limit") limit: Int = 50,

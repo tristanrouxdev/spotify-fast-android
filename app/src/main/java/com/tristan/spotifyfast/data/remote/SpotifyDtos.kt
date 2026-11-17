@@ -5,7 +5,7 @@ import kotlinx.serialization.Serializable
 
 @Serializable
 data class ImageDto(
-    val url: String,
+    val url: String = "",
     val height: Int? = null,
     val width: Int? = null,
 )
@@ -20,19 +20,23 @@ data class UserProfileDto(
 
 @Serializable
 data class PagingDto<T>(
-    val items: List<T> = emptyList(),
+    @SerialName("items") val rawItems: List<T?> = emptyList(),
     val limit: Int = 20,
     val offset: Int = 0,
     val total: Int = 0,
     val next: String? = null,
-)
+) {
+    val items: List<T> get() = rawItems.filterNotNull()
+}
 
 @Serializable
 data class CursorPagingDto<T>(
-    val items: List<T> = emptyList(),
+    @SerialName("items") val rawItems: List<T?> = emptyList(),
     val limit: Int = 20,
     val next: String? = null,
-)
+) {
+    val items: List<T> get() = rawItems.filterNotNull()
+}
 
 @Serializable
 data class PlaylistOwnerDto(
@@ -48,9 +52,9 @@ data class PlaylistItemsRefDto(
 
 @Serializable
 data class PlaylistSimplifiedDto(
-    val id: String,
-    val uri: String,
-    val name: String,
+    val id: String = "",
+    val uri: String = "",
+    val name: String = "",
     val description: String? = null,
     val images: List<ImageDto> = emptyList(),
     val owner: PlaylistOwnerDto? = null,
@@ -156,19 +160,27 @@ data class PlaylistItemWrapperDto(
 @Serializable
 data class SavedTrackDto(
     @SerialName("added_at") val addedAt: String? = null,
-    val track: PlayableItemDto,
-)
+    val track: PlayableItemDto? = null,
+    val item: PlayableItemDto? = null,
+) {
+    val resolvedTrack: PlayableItemDto? get() = track ?: item
+}
 
 @Serializable
 data class SavedAlbumDto(
     @SerialName("added_at") val addedAt: String? = null,
-    val album: AlbumSimplifiedDto,
+    val album: AlbumSimplifiedDto? = null,
 )
 
 @Serializable
 data class SavedShowDto(
     @SerialName("added_at") val addedAt: String? = null,
-    val show: ShowSimplifiedDto,
+    val show: ShowSimplifiedDto? = null,
+)
+
+@Serializable
+data class FollowedArtistsResponseDto(
+    val artists: CursorPagingDto<ArtistSimplifiedDto> = CursorPagingDto(),
 )
 
 @Serializable
@@ -221,7 +233,7 @@ data class PlayContextDto(
 
 @Serializable
 data class PlayHistoryDto(
-    val track: PlayableItemDto,
+    val track: PlayableItemDto? = null,
     @SerialName("played_at") val playedAt: String? = null,
     val context: PlayContextDto? = null,
 )

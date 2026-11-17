@@ -38,6 +38,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.tristan.spotifyfast.BuildConfig
 import com.tristan.spotifyfast.auth.PkceAuthManager
+import com.tristan.spotifyfast.data.sync.SyncStatus
 import com.tristan.spotifyfast.ui.theme.SpotifyTokens
 import com.tristan.spotifyfast.update.UpdateStatus
 import java.io.File
@@ -51,6 +52,7 @@ fun ProfileAndAudioStatusSheet(
     isDemoMode: Boolean,
     isAppRemoteConnected: Boolean,
     needsSsoAuthorization: Boolean = false,
+    syncStatus: SyncStatus = SyncStatus.Idle,
     lastAudioError: String?,
     ssoFeedback: String? = null,
     githubRepo: String,
@@ -92,6 +94,70 @@ fun ProfileAndAudioStatusSheet(
                 style = MaterialTheme.typography.bodySmall,
                 color = SpotifyTokens.AccentGreen,
             )
+
+            // Library & Playlists Sync Card (kept open to display live progress & counts)
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(SpotifyTokens.SurfaceElevated)
+                    .padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(
+                    text = "Bibliothèque & Playlists",
+                    style = MaterialTheme.typography.titleMedium,
+                )
+                when (syncStatus) {
+                    SyncStatus.Idle -> {
+                        Text(
+                            text = "Appuyez ci-dessous pour actualiser vos playlists, titres likés, albums et artistes.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = SpotifyTokens.TextSecondary,
+                        )
+                    }
+                    SyncStatus.Syncing -> {
+                        Text(
+                            text = "Synchronisation en cours...",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = SpotifyTokens.AccentGreen,
+                        )
+                        LinearProgressIndicator(
+                            modifier = Modifier.fillMaxWidth(),
+                            color = SpotifyTokens.AccentGreen,
+                            trackColor = SpotifyTokens.SurfaceHighlight,
+                        )
+                    }
+                    is SyncStatus.Success -> {
+                        Text(
+                            text = "Synchronisé : ${syncStatus.playlists} playlists • ${syncStatus.likedTracks} titres likés • ${syncStatus.albums} albums • ${syncStatus.artists} artistes",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = SpotifyTokens.AccentGreen,
+                        )
+                    }
+                    is SyncStatus.Error -> {
+                        Text(
+                            text = "Erreur de synchronisation : ${syncStatus.message}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = SpotifyTokens.ErrorRed,
+                        )
+                    }
+                }
+                Button(
+                    onClick = onSyncNow,
+                    enabled = syncStatus !is SyncStatus.Syncing,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = SpotifyTokens.AccentGreen,
+                        contentColor = Color.Black,
+                    ),
+                ) {
+                    Text(
+                        text = if (syncStatus is SyncStatus.Syncing) "Synchronisation..." else "Synchroniser playlists & bibliothèque",
+                        fontWeight = FontWeight.Bold,
+                    )
+                }
+            }
 
             // GitHub Auto-Update Card
             Column(
@@ -233,7 +299,7 @@ fun ProfileAndAudioStatusSheet(
                 }
             }
 
-            // Spotify App Remote Audio Diagnostic Card
+            // Spotify Audio Engine Card (Connect Web API active + optional App Remote IPC)
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -248,24 +314,32 @@ fun ProfileAndAudioStatusSheet(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text(
-                        text = "Pont audio Spotify App Remote",
+                        text = "Moteur Audio Spotify",
                         style = MaterialTheme.typography.titleMedium,
                     )
                     Text(
                         text = when {
                             isDemoMode -> "Audio Démo"
-                            isAppRemoteConnected -> "Connecté"
-                            else -> "Non lié"
+                            isAppRemoteConnected -> "Connecté (App Remote IPC)"
+                            else -> "Connecté (Spotify Connect)"
                         },
                         style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
-                        color = if (isDemoMode || isAppRemoteConnected) SpotifyTokens.AccentGreen else SpotifyTokens.ErrorRed,
+                        color = SpotifyTokens.AccentGreen,
                     )
                 }
 
-                val errorToDisplay = ssoFeedback ?: lastAudioError
-                if (!errorToDisplay.isNullOrBlank()) {
+                if (!isDemoMode && !isAppRemoteConnected) {
                     Text(
-                        text = errorToDisplay,
+                        text = "Lecture audio et contrôles actifs via Spotify Connect Web API & MediaSession.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = SpotifyTokens.TextSecondary,
+                    )
+                }
+
+                val diagnosticMessage = ssoFeedback ?: lastAudioError
+                if (!diagnosticMessage.isNullOrBlank()) {
+                    Text(
+                        text = diagnosticMessage,
                         style = MaterialTheme.typography.bodySmall,
                         color = SpotifyTokens.ErrorRed,
                     )
@@ -274,31 +348,33 @@ fun ProfileAndAudioStatusSheet(
                 if (!isDemoMode && !isAppRemoteConnected) {
                     val appSha1 = remember(context) { PkceAuthManager.readAppSigningSha1(context) }
                     Text(
-                        text = "Package : ${context.packageName} • SHA-1 : $appSha1",
+                        text = "Optionnel App Remote IPC — Package : ${context.packageName} • SHA-1 : $appSha1",
                         style = MaterialTheme.typography.labelSmall,
                         color = SpotifyTokens.TextSecondary,
                     )
+                    OutlinedButton(
+                        onClick = onReconnectSpotify,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            text = if (needsSsoAuthorization) {
+                                "Associer aussi App Remote IPC (optionnel)"
+                            } else {
+                                "Vérifier le pont App Remote IPC (optionnel)"
+                            },
+                            color = SpotifyTokens.TextPrimary,
+                        )
+                    }
+                } else if (!isDemoMode) {
+                    OutlinedButton(
+                        onClick = onReconnectSpotify,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text("Vérifier / Actualiser le pont audio", color = SpotifyTokens.TextPrimary)
+                    }
                 }
 
                 if (!isDemoMode) {
-                    Button(
-                        onClick = onReconnectSpotify,
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (needsSsoAuthorization) SpotifyTokens.AccentGreen else SpotifyTokens.SurfaceHighlight,
-                            contentColor = if (needsSsoAuthorization) Color.Black else SpotifyTokens.TextPrimary,
-                        ),
-                    ) {
-                        Text(
-                            text = when {
-                                isAppRemoteConnected -> "Vérifier / Actualiser le pont audio"
-                                needsSsoAuthorization -> "Connecter l'application Spotify (Autoriser SSO)"
-                                else -> "Connecter l'application Spotify"
-                            },
-                            fontWeight = FontWeight.SemiBold,
-                        )
-                    }
-
                     OutlinedButton(
                         onClick = {
                             runCatching {
@@ -314,16 +390,6 @@ fun ProfileAndAudioStatusSheet(
                         Text("Ouvrir Spotify officiel (pour réveiller/autoriser)", color = SpotifyTokens.TextPrimary)
                     }
                 }
-            }
-
-            OutlinedButton(
-                onClick = {
-                    onSyncNow()
-                    onDismiss()
-                },
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text("Synchroniser playlists & bibliothèque", color = SpotifyTokens.TextPrimary)
             }
 
             HorizontalDivider(color = SpotifyTokens.Divider)

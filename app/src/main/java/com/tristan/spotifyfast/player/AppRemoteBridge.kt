@@ -399,7 +399,7 @@ class AppRemoteBridge(
                 putExtra("VERSION", 1)
                 putExtra("CLIENT_ID", cleanClientId)
                 putExtra("REDIRECT_URI", redirectUri)
-                putExtra("RESPONSE_TYPE", "code")
+                putExtra("RESPONSE_TYPE", "token")
                 putExtra(
                     "SCOPES",
                     arrayOf(

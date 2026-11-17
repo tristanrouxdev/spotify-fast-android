@@ -204,4 +204,42 @@ class SpotifyWebApi2026ContractTest {
         assertTrue(com.tristan.spotifyfast.update.AppUpdateManager.isNewerVersion("v1.2.0", "1.1.0"))
         assertTrue(!com.tristan.spotifyfast.update.AppUpdateManager.isNewerVersion("v1.1.0", "1.1.0"))
     }
+
+    @Test
+    fun `sync engine filters null playlist items, uses tracks fallback, syncs artists, and emits SyncStatus`() = runTest {
+        tokenStore.saveTokenBundle(
+            AuthTokenBundle("cid", "tok", "ref", System.currentTimeMillis() + 3600_000L),
+        )
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                val p = request.path.orEmpty()
+                return when {
+                    p.startsWith("/v1/me/playlists") -> MockResponse().setResponseCode(200).setBody(
+                        """{"items":[null,{"id":"pl_mix","uri":"spotify:playlist:pl_mix","name":"Mix 1","tracks":{"total":1}}]}""",
+                    )
+                    p.startsWith("/v1/playlists/pl_mix/items") -> MockResponse().setResponseCode(404)
+                    p.startsWith("/v1/playlists/pl_mix/tracks") -> MockResponse().setResponseCode(200).setBody(
+                        """{"items":[null,{"track":{"id":"tr_mix","uri":"spotify:track:tr_mix","name":"Mix Song","duration_ms":210000,"artists":[{"id":"ar1","name":"Artist"}]}}]}""",
+                    )
+                    p.startsWith("/v1/me/following") -> MockResponse().setResponseCode(200).setBody(
+                        """{"artists":{"items":[{"id":"ar1","uri":"spotify:artist:ar1","name":"Followed Artist","genres":["synthwave"]}]}}""",
+                    )
+                    else -> MockResponse().setResponseCode(200).setBody("""{"items":[]}""")
+                }
+            }
+        }
+
+        val engine = OfflineFirstSyncEngine(db.spotifyDao(), api, tokenStore)
+        val res = engine.syncAll()
+        assertTrue(res.isSuccess)
+        val tracks = db.spotifyDao().getTracksForContextOnce("spotify:playlist:pl_mix")
+        assertEquals(1, tracks.size)
+        assertEquals("Mix Song", tracks[0].title)
+        val artists = db.spotifyDao().observeArtists().first()
+        assertEquals(1, artists.size)
+        assertEquals("Followed Artist", artists[0].name)
+        val status = engine.syncStatus.value as com.tristan.spotifyfast.data.sync.SyncStatus.Success
+        assertEquals(1, status.playlists)
+        assertEquals(1, status.artists)
+    }
 }

@@ -157,6 +157,7 @@ private fun SpotifyFastRoot(
     val isAppRemoteConnected by container.playbackRouter.isAppRemoteConnected.collectAsStateWithLifecycle()
     val lastAudioError by container.playbackRouter.lastErrorMessage.collectAsStateWithLifecycle()
     val needsSsoAuthorization by container.playbackRouter.needsSsoAuthorization.collectAsStateWithLifecycle()
+    val syncStatus by container.syncEngine.syncStatus.collectAsStateWithLifecycle()
     val updateStatus by container.appUpdateManager.status.collectAsStateWithLifecycle()
 
     val context = LocalContext.current
@@ -175,25 +176,24 @@ private fun SpotifyFastRoot(
             }
             -2 -> { // Spotify LoginActivity.RESULT_ERROR
                 val rawErr = result.data?.getStringExtra("ERROR") ?: "Erreur autorisation Spotify"
-                Log.e("SpotifyFast", "Native SSO error (-2): $rawErr")
+                val rawDesc = result.data?.getStringExtra("ERROR_DESCRIPTION").orEmpty()
+                Log.e("SpotifyFast", "Native SSO error (-2): $rawErr | desc=$rawDesc")
                 val sha1 = PkceAuthManager.readAppSigningSha1(context)
                 ssoFeedback = if (
                     rawErr.contains("INVALID", ignoreCase = true) ||
                     rawErr.contains("APP_ID", ignoreCase = true) ||
                     rawErr.contains("AUTHENTICATION", ignoreCase = true)
                 ) {
-                    "Spotify App Remote a retourné : $rawErr.\n" +
-                        "Pour App Remote, ajoutez dans Spotify Developer Dashboard :\n" +
-                        "• Package Android : ${context.packageName}\n" +
-                        "• Empreinte SHA-1 : $sha1\n" +
-                        "Le mode Spotify Connect Web API prend automatiquement le relais sans SHA-1 si l'app Spotify a une session active."
+                    "App Remote IPC a retourné $rawErr${if (rawDesc.isNotBlank()) " ($rawDesc)" else ""}.\n" +
+                        "Pour l'IPC optionnel, ajoutez dans Spotify Developer Dashboard : Package=${context.packageName}, SHA-1=$sha1.\n" +
+                        "Votre lecture et votre synchronisation fonctionnent déjà normalement sans cela via Spotify Connect !"
                 } else {
-                    "Erreur autorisation Spotify ($rawErr)"
+                    "Erreur App Remote IPC ($rawErr${if (rawDesc.isNotBlank()) ": $rawDesc" else ""})"
                 }
             }
             Activity.RESULT_CANCELED -> {
                 Log.w("SpotifyFast", "Native SSO cancelled (resultCode=0)")
-                ssoFeedback = "Autorisation Spotify annulée ou bloquée (vérifiez Package=${context.packageName} / SHA-1 dans votre Dashboard Spotify)."
+                ssoFeedback = "Autorisation App Remote IPC annulée (Spotify Connect reste actif)."
             }
         }
     }
@@ -530,6 +530,7 @@ private fun SpotifyFastRoot(
                 isDemoMode = isDemoMode,
                 isAppRemoteConnected = isAppRemoteConnected,
                 needsSsoAuthorization = needsSsoAuthorization,
+                syncStatus = syncStatus,
                 lastAudioError = lastAudioError,
                 ssoFeedback = ssoFeedback,
                 githubRepo = githubRepo,

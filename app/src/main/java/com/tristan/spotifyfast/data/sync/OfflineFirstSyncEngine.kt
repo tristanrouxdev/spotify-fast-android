@@ -21,10 +21,26 @@ import com.tristan.spotifyfast.data.remote.SearchResponseDto
 import com.tristan.spotifyfast.data.remote.SpotifyWebApi
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+
+sealed interface SyncStatus {
+    data object Idle : SyncStatus
+    data object Syncing : SyncStatus
+    data class Success(
+        val playlists: Int,
+        val likedTracks: Int,
+        val albums: Int,
+        val shows: Int,
+        val artists: Int,
+    ) : SyncStatus
+    data class Error(val message: String) : SyncStatus
+}
 
 /**
  * Stale-While-Revalidate synchronization engine.
@@ -39,6 +55,12 @@ class OfflineFirstSyncEngine(
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) {
     private val syncMutex = Mutex()
+    private val _syncStatus = MutableStateFlow<SyncStatus>(SyncStatus.Idle)
+    val syncStatus: StateFlow<SyncStatus> = _syncStatus.asStateFlow()
+
+    private fun logInfo(msg: String) {
+        runCatching { Log.i("SpotifyFast", msg) }
+    }
 
     private fun logError(msg: String, err: Throwable) {
         runCatching { Log.e("SpotifyFast", msg, err) }
@@ -49,11 +71,21 @@ class OfflineFirstSyncEngine(
             val bundle = tokenStore.loadTokenBundle()
             if (bundle?.isDemoMode == true) {
                 seedDemoDataIfNeeded()
+                _syncStatus.value = SyncStatus.Success(
+                    playlists = dao.getAllPlaylistsOnce().size,
+                    likedTracks = dao.observeLikedTracksCount().first(),
+                    albums = dao.observeAlbums().first().size,
+                    shows = dao.observeShows().first().size,
+                    artists = dao.observeArtists().first().size,
+                )
                 return@withContext Result.success(Unit)
             }
             if (bundle == null || bundle.accessToken.isBlank()) {
                 return@withContext Result.success(Unit)
             }
+
+            _syncStatus.value = SyncStatus.Syncing
+            logInfo("Starting syncAll() for user library & playlists")
 
             runCatching {
                 runCatching { api.getCurrentProfile() }
@@ -72,9 +104,11 @@ class OfflineFirstSyncEngine(
                     .onFailure { logError("Sync getUserPlaylists failed", it) }
                     .getOrNull()
                 if (playlists != null) {
-                    val playlistEntities = playlists.mapIndexed { index, dto ->
+                    val validPlaylists = playlists.filter { it.id.isNotBlank() && it.uri.isNotBlank() }
+                    logInfo("Synced ${validPlaylists.size} playlists metadata from API")
+                    val playlistEntities = validPlaylists.mapIndexed { index, dto ->
                         val existing = existingPlaylists[dto.id]
-                        val art = dto.images.firstOrNull()?.url
+                        val art = dto.images.firstOrNull()?.url?.takeIf { it.isNotBlank() }
                         val color = existing?.dominantColorArgb
                             ?: paletteExtractor?.extractDominantColor(art)
                             ?: DEFAULT_DOMINANT_COLOR
@@ -95,11 +129,13 @@ class OfflineFirstSyncEngine(
                     }
                     dao.upsertPlaylists(playlistEntities)
 
-                    // Differential item sync: only refetch playlists whose snapshot_id changed
-                    playlists.take(8).forEach { dto ->
+                    // Differential item sync: fetch up to 20 playlists if new, snapshot changed, or expected tracks missing
+                    validPlaylists.take(20).forEach { dto ->
                         val prev = existingPlaylists[dto.id]
-                        if (prev == null || prev.snapshotId != dto.snapshotId) {
+                        val missingCachedTracks = dto.itemCount > 0 && dao.getTracksForContextOnce(dto.uri).isEmpty()
+                        if (prev == null || prev.snapshotId != dto.snapshotId || missingCachedTracks) {
                             runCatching { syncPlaylistItems(dto.id, dto.uri) }
+                                .onFailure { logError("Sync playlist items failed (${dto.id})", it) }
                         }
                     }
                 }
@@ -107,8 +143,10 @@ class OfflineFirstSyncEngine(
                 // Saved tracks (Liked Songs)
                 runCatching {
                     val savedTracks = api.getSavedTracks(limit = 50).items
-                    val entities = savedTracks.mapIndexed { idx, wrapper ->
-                        wrapper.track.toTrackEntity(
+                    val entities = savedTracks.mapIndexedNotNull { idx, wrapper ->
+                        val track = wrapper.resolvedTrack ?: return@mapIndexedNotNull null
+                        if (track.uri.isBlank()) return@mapIndexedNotNull null
+                        track.toTrackEntity(
                             contextUri = LIKED_TRACKS_CONTEXT_URI,
                             position = idx,
                             isLiked = true,
@@ -116,56 +154,84 @@ class OfflineFirstSyncEngine(
                     }
                     dao.deleteTracksForContext(LIKED_TRACKS_CONTEXT_URI)
                     dao.upsertTracks(entities)
-                }
+                    logInfo("Synced ${entities.size} liked tracks")
+                }.onFailure { logError("Sync getSavedTracks failed", it) }
 
                 // Saved albums
                 runCatching {
                     val albums = api.getSavedAlbums(limit = 50).items
-                    val entities = albums.map { saved ->
-                        val art = saved.album.images.firstOrNull()?.url
+                    val entities = albums.mapNotNull { saved ->
+                        val album = saved.album ?: return@mapNotNull null
+                        if (album.id.isBlank()) return@mapNotNull null
+                        val art = album.images.firstOrNull()?.url?.takeIf { it.isNotBlank() }
                         AlbumEntity(
-                            id = saved.album.id,
-                            uri = saved.album.uri,
-                            name = saved.album.name,
-                            artistName = saved.album.artists.joinToString(", ") { it.name },
+                            id = album.id,
+                            uri = album.uri,
+                            name = album.name,
+                            artistName = album.artists.joinToString(", ") { it.name },
                             artworkUrl = art,
-                            releaseYear = saved.album.releaseDate?.take(4).orEmpty(),
-                            totalTracks = saved.album.totalTracks,
+                            releaseYear = album.releaseDate?.take(4).orEmpty(),
+                            totalTracks = album.totalTracks,
                             dominantColorArgb = paletteExtractor?.extractDominantColor(art)
                                 ?: DEFAULT_DOMINANT_COLOR,
                         )
                     }
                     dao.upsertAlbums(entities)
-                }
+                    logInfo("Synced ${entities.size} saved albums")
+                }.onFailure { logError("Sync getSavedAlbums failed", it) }
+
+                // Followed artists
+                runCatching {
+                    val followed = api.getFollowedArtists(limit = 50).artists.items
+                    val entities = followed.filter { it.id.isNotBlank() }.map { artist ->
+                        val art = artist.images.firstOrNull()?.url?.takeIf { it.isNotBlank() }
+                        ArtistEntity(
+                            id = artist.id,
+                            uri = artist.uri,
+                            name = artist.name,
+                            artworkUrl = art,
+                            genresCsv = artist.genres.joinToString(", "),
+                            dominantColorArgb = paletteExtractor?.extractDominantColor(art)
+                                ?: DEFAULT_DOMINANT_COLOR,
+                        )
+                    }
+                    dao.upsertArtists(entities)
+                    logInfo("Synced ${entities.size} followed artists")
+                }.onFailure { logError("Sync getFollowedArtists failed", it) }
 
                 // Saved podcasts / shows & latest episodes
                 runCatching {
                     val shows = api.getSavedShows(limit = 30).items
-                    val showEntities = shows.map { saved ->
-                        val art = saved.show.images.firstOrNull()?.url
+                    val showEntities = shows.mapNotNull { saved ->
+                        val show = saved.show ?: return@mapNotNull null
+                        if (show.id.isBlank()) return@mapNotNull null
+                        val art = show.images.firstOrNull()?.url?.takeIf { it.isNotBlank() }
                         ShowEntity(
-                            id = saved.show.id,
-                            uri = saved.show.uri,
-                            name = saved.show.name,
-                            publisher = saved.show.publisher.orEmpty(),
-                            description = saved.show.description.orEmpty(),
+                            id = show.id,
+                            uri = show.uri,
+                            name = show.name,
+                            publisher = show.publisher.orEmpty(),
+                            description = show.description.orEmpty(),
                             artworkUrl = art,
-                            totalEpisodes = saved.show.totalEpisodes,
+                            totalEpisodes = show.totalEpisodes,
                             dominantColorArgb = paletteExtractor?.extractDominantColor(art)
                                 ?: DEFAULT_DOMINANT_COLOR,
                         )
                     }
                     dao.upsertShows(showEntities)
                     shows.take(5).forEach { saved ->
-                        runCatching { syncShowEpisodes(saved.show.id, saved.show.uri, saved.show.name) }
+                        val show = saved.show ?: return@forEach
+                        runCatching { syncShowEpisodes(show.id, show.uri, show.name) }
+                            .onFailure { logError("Sync episodes failed (${show.id})", it) }
                     }
-                }
+                    logInfo("Synced ${showEntities.size} saved shows")
+                }.onFailure { logError("Sync getSavedShows failed", it) }
 
                 // Saved audiobooks
                 runCatching {
                     val audiobooks = api.getSavedAudiobooks(limit = 20).items
-                    val entities = audiobooks.map { book ->
-                        val art = book.images.firstOrNull()?.url
+                    val entities = audiobooks.filter { it.id.isNotBlank() }.map { book ->
+                        val art = book.images.firstOrNull()?.url?.takeIf { it.isNotBlank() }
                         AudiobookEntity(
                             id = book.id,
                             uri = book.uri,
@@ -179,13 +245,16 @@ class OfflineFirstSyncEngine(
                         )
                     }
                     dao.upsertAudiobooks(entities)
-                }
+                    logInfo("Synced ${entities.size} saved audiobooks")
+                }.onFailure { logError("Sync getSavedAudiobooks failed", it) }
 
                 // Recently played tracks & shortcuts construction
                 runCatching {
                     val recent = api.getRecentlyPlayed(limit = 20).items
-                    val recentEntities = recent.mapIndexed { idx, history ->
-                        history.track.toTrackEntity(
+                    val recentEntities = recent.mapIndexedNotNull { idx, history ->
+                        val track = history.track ?: return@mapIndexedNotNull null
+                        if (track.uri.isBlank()) return@mapIndexedNotNull null
+                        track.toTrackEntity(
                             contextUri = "spotify:recent",
                             position = idx,
                             isLiked = false,
@@ -204,17 +273,45 @@ class OfflineFirstSyncEngine(
                             batch.zip(flags).forEach { (uri, liked) ->
                                 dao.updateTrackLikedFlag(uri, liked)
                             }
-                        }
+                        }.onFailure { logError("Sync checkLibraryContains failed", it) }
                     }
-                }
+                    logInfo("Synced ${recentEntities.size} recently played tracks")
+                }.onFailure { logError("Sync getRecentlyPlayed failed", it) }
 
                 rebuildHomeShortcuts()
+
+                val status = SyncStatus.Success(
+                    playlists = dao.getAllPlaylistsOnce().size,
+                    likedTracks = dao.observeLikedTracksCount().first(),
+                    albums = dao.observeAlbums().first().size,
+                    shows = dao.observeShows().first().size,
+                    artists = dao.observeArtists().first().size,
+                )
+                _syncStatus.value = status
+                logInfo(
+                    "syncAll completed: playlists=${status.playlists}, likedTracks=${status.likedTracks}, " +
+                        "albums=${status.albums}, shows=${status.shows}, artists=${status.artists}",
+                )
+            }.onFailure { err ->
+                logError("syncAll top-level failure", err)
+                _syncStatus.value = SyncStatus.Error(err.message ?: "Erreur de synchronisation")
             }
         }
     }
 
     suspend fun syncPlaylistItems(playlistId: String, playlistUri: String) = withContext(ioDispatcher) {
-        val page = api.getPlaylistItems(playlistId, limit = 50)
+        val primaryPage = runCatching { api.getPlaylistItems(playlistId, limit = 50) }
+            .onFailure { logError("getPlaylistItems($playlistId) failed, trying /tracks fallback", it) }
+            .getOrNull()
+        val page = if (primaryPage != null && primaryPage.items.isNotEmpty()) {
+            primaryPage
+        } else {
+            runCatching { api.getPlaylistTracks(playlistId, limit = 50) }
+                .onFailure { logError("getPlaylistTracks($playlistId) fallback failed", it) }
+                .getOrNull()
+                ?: primaryPage
+                ?: throw IllegalStateException("Impossible de récupérer les titres de la playlist $playlistId")
+        }
         val tracks = page.items.mapIndexedNotNull { idx, wrapper ->
             val item = wrapper.resolvedItem ?: return@mapIndexedNotNull null
             if (item.uri.isBlank()) return@mapIndexedNotNull null
@@ -226,6 +323,7 @@ class OfflineFirstSyncEngine(
         }
         dao.deleteTracksForContext(playlistUri)
         dao.upsertTracks(tracks)
+        logInfo("Synced ${tracks.size} tracks for playlist $playlistId")
     }
 
     suspend fun syncAlbumTracks(albumId: String, albumUri: String) = withContext(ioDispatcher) {
@@ -526,7 +624,7 @@ class OfflineFirstSyncEngine(
             PlayableItemDto("demo2", "spotify:track:demo2", "Resonance", "track", 212_000L),
         ).filter { it.name.lowercase().contains(q) }
         return SearchResponseDto(
-            tracks = com.tristan.spotifyfast.data.remote.PagingDto(items = demoTracks, total = demoTracks.size),
+            tracks = com.tristan.spotifyfast.data.remote.PagingDto(rawItems = demoTracks, total = demoTracks.size),
         )
     }
 

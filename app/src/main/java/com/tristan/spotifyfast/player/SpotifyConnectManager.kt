@@ -55,13 +55,20 @@ class SpotifyConnectManager(
                     isLocalPhone = dto.type.equals("Smartphone", ignoreCase = true) && dto.isActive,
                 )
             }
+        }.onFailure { err ->
+            logError("fetchDevices failed: ${err.message}", err)
         }
     }
 
     suspend fun fetchCurrentPlaybackState(): Result<PlaybackStateDto?> = withContext(ioDispatcher) {
         runCatching {
             val response = api.getPlaybackState()
+            if (!response.isSuccessful && response.code() != 204) {
+                logError("getPlaybackState HTTP ${response.code()}")
+            }
             if (response.code() == 204 || !response.isSuccessful) null else response.body()
+        }.onFailure { err ->
+            logError("fetchCurrentPlaybackState failed: ${err.message}", err)
         }
     }
 
@@ -78,6 +85,8 @@ class SpotifyConnectManager(
                     durationMs = item.durationMs,
                 )
             }
+        }.onFailure { err ->
+            logError("fetchQueue failed: ${err.message}", err)
         }
     }
 
